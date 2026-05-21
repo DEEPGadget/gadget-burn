@@ -11,14 +11,17 @@
  * 실행:
  *   ./gadget_burn [옵션]
  *
- *   -t <초>       총 측정 시간                (기본: 3600)
- *   -i <강도>     GPU 당 동시 GEMM 스트림 수  (기본: 1)
- *   -p <타입>     sgemm | dgemm | hgemm      (기본: sgemm)
+ *   -t <초>       총 측정 시간                       (기본: 3600)
+ *   -i <강도>     GPU 당 동시 GEMM 스트림 수         (기본: 1)
+ *   -p <타입>     sgemm | dgemm | hgemm | hgemm_mix  (기본: hgemm_mix)
+ *                 hgemm     → FP16 in / FP16 acc Tensor Core (피크 TFLOPS 최대)
+ *                 hgemm_mix → FP16 in / FP32 acc Tensor Core (mixed precision)
+ *                             실측 TDP 최대, burn-in 기본값
  *   -m <값>       메모리 사용량
- *                   숫자   : M=N=K 행렬 크기  (예: -m 8192)
- *                   숫자%  : VRAM 대비 비율   (예: -m 80%)
+ *                   숫자   : M=N=K 행렬 크기         (예: -m 8192)
+ *                   숫자%  : VRAM 대비 비율          (예: -m 80%)
  *                 (기본: 100%)
- *   -g <목록>     GPU ID 쉼표 구분           (기본: 전체)
+ *   -g <목록>     GPU ID 쉼표 구분                  (기본: 전체)
  *   -l            GPU 목록 출력 후 종료
  *   -h            도움말
  */
@@ -110,40 +113,45 @@
    ───────────────────────────────────────────────────────── */
 
 typedef struct {
-    const char *substr;      /* cudaDeviceProp.name 부분 매칭 키 */
-    int         cores_fp32;  /* CUDA FP32 코어 수 */
-    int         cores_fp64;  /* CUDA FP64 코어 수 (0 = 미지원) */
-    int         cores_tensor;/* Tensor Core 수 */
-    int         tc_ops;      /* Tensor Core당 클럭당 FP16 ops (acc=FP16) */
+    const char *substr;       /* cudaDeviceProp.name 부분 매칭 키 */
+    int         cores_fp32;   /* CUDA FP32 코어 수 */
+    int         cores_fp64;   /* CUDA FP64 코어 수 (0 = 미지원) */
+    int         cores_tensor; /* Tensor Core 수 */
+    int         tc_ops;       /* TC 1개당 클럭당 ops, FP16 in / FP16 acc, dense */
+    int         tc_ops_mix;   /* TC 1개당 클럭당 ops, FP16 in / FP32 acc, dense
+                                 소비자/Pro급: tc_ops의 1/2 (HW 반속)
+                                 서버급(A100/H100/H200): tc_ops와 동일 (페널티 없음) */
 } CoreEntry;
 
 /* 구체적인 이름(긴 것)을 먼저 배치해야 substring 매칭이 올바르게 동작 */
 static const CoreEntry CORE_TABLE[] = {
     /* Blackwell RTX PRO — GB202 full (188 SM)
        FP32=128/SM×188=24064, FP64=2/SM=376
-       5th gen Tensor Core: tc_ops≈1024                               */
-    { "RTX PRO 6000 Blackwell Server Edition", 24064, 376, 752, 256 },
-    { "RTX PRO 6000 Blackwell Max-Q",          24064, 376, 752, 256 },
-    { "RTX PRO 6000 Blackwell",                24064, 376, 752, 256 },
+       소비자 다이(GB202) 공유. whitepaper는 풀스피드라 하지만 실측은 반속 → tc_ops_mix=128 */
+    { "RTX PRO 6000 Blackwell Server Edition", 24064, 376, 752, 256, 128 },
+    { "RTX PRO 6000 Blackwell Max-Q",          24064, 376, 752, 256, 128 },
+    { "RTX PRO 6000 Blackwell",                24064, 376, 752, 256, 128 },
     /* Blackwell GeForce — GB202 (170 SM), GB203 (84 SM)
-       FP64=2/SM (소비자급). 5th gen TC: tc_ops≈1024                  */
-    { "GeForce RTX 5090",                      21760, 340, 680, 256 },
-    { "GeForce RTX 5080",                      10752, 168, 336, 256 },
+       FP64=2/SM (소비자급). HW 강제 반속 → tc_ops_mix = tc_ops/2          */
+    { "GeForce RTX 5090",                      21760, 340, 680, 256, 128 },
+    { "GeForce RTX 5080",                      10752, 168, 336, 256, 128 },
     /* Ada GeForce — AD102 (128 SM), AD103 (76 SM)
-       FP64=2/SM (소비자급). 4th gen TC: tc_ops≈512                   */
-    { "GeForce RTX 4090",                      16384, 256, 512,  256 },
-    { "GeForce RTX 4080",                       9728, 152, 304,  256 },
+       FP64=2/SM (소비자급). HW 강제 반속 → tc_ops_mix=128                 */
+    { "GeForce RTX 4090",                      16384, 256, 512, 256, 128 },
+    { "GeForce RTX 4080",                       9728, 152, 304, 256, 128 },
     /* Ada Professional / Data Center — AD102 full (142 SM)
-       RTX 6000 Ada: FP64=2/SM=284. L40S: FP64 코어 없음              */
-    { "RTX 6000 Ada",                          18176, 284, 568,  256 },
-    { "L40S",                                  18176, 284, 568,  256 },
+       RTX 6000 Ada/L40S도 AD102 공유. 실측 반속 가정 → tc_ops_mix=128     */
+    { "RTX 6000 Ada",                          18176, 284, 568, 256, 128 },
+    { "L40S",                                  18176, 284, 568, 256, 128 },
     /* Hopper — GH100 (132 SM for H200 NVL)
-       FP64=64/SM=8448 (전용 코어). 4th gen TC: tc_ops≈2048           */
-    { "H200 NVL",                              16896, 8448, 528, 2048 },
-    { "H200",                                  16896, 8448, 528, 2048 },
-    { "A100",                                  6912, 3456, 432, 512 },
+       FP64=64/SM=8448 (전용 코어). dense FP16 (acc=FP16 or FP32) = 989 TFLOPS
+       per Hopper whitepaper: FP32 누산 페널티 없음 → tc_ops_mix = tc_ops  */
+    { "H200 NVL",                              16896, 8448, 528, 1024, 1024 },
+    { "H200",                                  16896, 8448, 528, 1024, 1024 },
+    /* Ampere DC — GA100, FP32 누산 페널티 없음                            */
+    { "A100",                                   6912, 3456, 432,  512,  512 },
     /* sentinel */
-    { NULL, 0, 0, 0, 0 }
+    { NULL, 0, 0, 0, 0, 0 }
 };
 
 /* GPU 이름으로 CoreEntry 검색 (대소문자 무시, substring 매칭) */
@@ -194,7 +202,7 @@ static inline double now_sec(void)
    타입 정의
    ───────────────────────────────────────────────────────── */
 
-typedef enum { PREC_SGEMM, PREC_DGEMM, PREC_HGEMM } PrecType;
+typedef enum { PREC_SGEMM, PREC_DGEMM, PREC_HGEMM, PREC_HGEMM_MIX } PrecType;
 
 typedef struct {
     int    is_percent;  /* 1 = VRAM 비율, 0 = 절대 행렬 크기 */
@@ -295,9 +303,10 @@ static int calc_mat_size(int device_id, MemSpec spec,
 
     size_t bpe;
     switch (prec) {
-        case PREC_DGEMM: bpe = 8; break;
-        case PREC_HGEMM: bpe = 2; break;
-        default:         bpe = 4; break;
+        case PREC_DGEMM:     bpe = 8; break;
+        case PREC_HGEMM:
+        case PREC_HGEMM_MIX: bpe = 2; break;
+        default:             bpe = 4; break;
     }
 
     /* target = intensity × 3 × M² × bpe  →  M = sqrt(target / (intensity×3×bpe)) */
@@ -328,9 +337,10 @@ static void worker_init(GemmWorker *w, int device_id,
 
     size_t bpe;
     switch (prec) {
-        case PREC_DGEMM: bpe = sizeof(double); break;
-        case PREC_HGEMM: bpe = sizeof(__half);  break;
-        default:         bpe = sizeof(float);   break;
+        case PREC_DGEMM:     bpe = sizeof(double); break;
+        case PREC_HGEMM:
+        case PREC_HGEMM_MIX: bpe = sizeof(__half);  break;
+        default:             bpe = sizeof(float);   break;
     }
 
     size_t szA = (size_t)M * K * bpe;
@@ -350,9 +360,10 @@ static size_t worker_vram_bytes(const GemmWorker *w)
 {
     size_t bpe;
     switch (w->prec) {
-        case PREC_DGEMM: bpe = 8; break;
-        case PREC_HGEMM: bpe = 2; break;
-        default:         bpe = 4; break;
+        case PREC_DGEMM:     bpe = 8; break;
+        case PREC_HGEMM:
+        case PREC_HGEMM_MIX: bpe = 2; break;
+        default:             bpe = 4; break;
     }
     return bpe * 3 * (size_t)w->M * w->N; /* A + B + C, M=N=K이므로 3×M² */
 }
@@ -407,6 +418,22 @@ static void run_gemm(GemmWorker *w)
                     w->dB, CUDA_R_16F, K,
             &beta,  w->dC, CUDA_R_16F, M,
             CUBLAS_COMPUTE_16F,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        break;
+    }
+    case PREC_HGEMM_MIX: {
+        /* FP16 입력/출력 storage + FP32 누산 (mixed precision)
+           compute=32F → scalar는 FP32. Tensor Core가 FP32 누산기 모드로 동작.
+           이론 TFLOPS는 PREC_HGEMM의 1/2 (소비자/Pro급) 또는 동일 (서버급)이지만
+           실측 TDP가 가장 높아 burn-in 기본값으로 사용됩니다. */
+        const float alpha = 1.f, beta = 0.f;
+        CUBLAS_CHECK(cublasGemmEx(
+            w->handle, CUBLAS_OP_N, CUBLAS_OP_N,
+            M, N, K,
+            &alpha, w->dA, CUDA_R_16F, M,
+                    w->dB, CUDA_R_16F, K,
+            &beta,  w->dC, CUDA_R_16F, M,
+            CUBLAS_COMPUTE_32F,
             CUBLAS_GEMM_DEFAULT_TENSOR_OP));
         break;
     }
@@ -625,9 +652,12 @@ static double calc_tflops_win(const GpuCtx *gc)
    고정 하드코딩 값과 달리 실측 클럭에 비례하므로
    Boost Clock 변동이 즉시 Peak%에 반영됩니다.
 
-   FP32 : cores_fp32   × 2 ops/cycle × clock_MHz × 1e-6  [TFLOPS]
-   FP64 : cores_fp64   × 2 ops/cycle × clock_MHz × 1e-6  [TFLOPS]
-   FP16T: cores_tensor × tc_ops/cycle × clock_MHz × 1e-6 [TFLOPS]
+   FP32     : cores_fp32   × 2 ops/cycle      × clock_MHz × 1e-6  [TFLOPS]
+   FP64     : cores_fp64   × 2 ops/cycle      × clock_MHz × 1e-6  [TFLOPS]
+   FP16T    : cores_tensor × tc_ops/cycle     × clock_MHz × 1e-6  [TFLOPS]
+   FP16T_MIX: cores_tensor × tc_ops_mix/cycle × clock_MHz × 1e-6  [TFLOPS]
+              소비자/Pro급: tc_ops_mix = tc_ops/2 (HW 반속)
+              서버급(A100/H100/H200): tc_ops_mix = tc_ops (페널티 없음)
    ───────────────────────────────────────────────────────── */
 
 static double calc_dynamic_rpeak(const GpuCtx *gc, PrecType prec, double clock_mhz)
@@ -641,7 +671,11 @@ static double calc_dynamic_rpeak(const GpuCtx *gc, PrecType prec, double clock_m
         case PREC_HGEMM:
             return gc->core_info.cores_tensor
                    * (double)gc->core_info.tc_ops * clock_mhz * 1e-6;
-        default: /* PREC_SGEMM */
+        case PREC_HGEMM_MIX:
+            return gc->core_info.cores_tensor
+                   * (double)gc->core_info.tc_ops_mix * clock_mhz * 1e-6;
+        case PREC_SGEMM:
+        default:
             return gc->core_info.cores_fp32 * 2.0 * clock_mhz * 1e-6;
     }
 }
@@ -796,20 +830,28 @@ static int parse_gpu_list(const char *str, int *ids, int max_n)
 static void print_usage(const char *prog)
 {
     printf("\n사용법: %s [옵션]\n\n", prog);
-    printf("  -t <초>      총 측정 시간                 (기본: 3600)\n");
-    printf("  -i <강도>    GPU 당 동시 GEMM 스트림 수   (기본: 1)\n");
-    printf("  -p <타입>    sgemm | dgemm | hgemm       (기본: sgemm)\n");
-    printf("               hgemm → FP16 Tensor Core 강제\n");
+    printf("  -t <초>      총 측정 시간                          (기본: 3600)\n");
+    printf("  -i <강도>    GPU 당 동시 GEMM 스트림 수            (기본: 1)\n");
+    printf("  -p <타입>    sgemm | dgemm | hgemm | hgemm_mix     (기본: hgemm_mix)\n");
+    printf("               sgemm     → FP32 (cublasSgemm)\n");
+    printf("               dgemm     → FP64 (cublasDgemm)\n");
+    printf("               hgemm     → FP16 in / FP16 acc Tensor Core\n");
+    printf("                           이론 피크 TFLOPS가 가장 높음\n");
+    printf("               hgemm_mix → FP16 in / FP32 acc Tensor Core (mixed precision)\n");
+    printf("                           소비자/Pro급은 hgemm의 1/2 처리량,\n");
+    printf("                           서버급(A100/H100/H200)은 hgemm과 동일.\n");
+    printf("                           실측 TDP가 가장 높아 burn-in 기본값.\n");
     printf("  -m <값>      메모리 사용량\n");
-    printf("                 숫자   : M=N=K 행렬 크기   (예: -m 8192)\n");
-    printf("                 숫자%%  : VRAM 대비 비율    (예: -m 80%%)\n");
+    printf("                 숫자   : M=N=K 행렬 크기            (예: -m 8192)\n");
+    printf("                 숫자%%  : VRAM 대비 비율             (예: -m 80%%)\n");
     printf("               (기본: -m 100%%)\n");
-    printf("  -g <목록>    사용할 GPU ID (쉼표 구분)    (기본: 전체)\n");
+    printf("  -g <목록>    사용할 GPU ID (쉼표 구분)             (기본: 전체)\n");
     printf("  -l           GPU 목록 출력 후 종료\n");
     printf("  -h           도움말\n\n");
     printf("예시:\n");
-    printf("  %s                           # 전체 GPU, sgemm, 100%% VRAM\n", prog);
-    printf("  %s -p hgemm -m 80%%          # FP16 Tensor Core, 80%% VRAM\n", prog);
+    printf("  %s                           # 전체 GPU, hgemm_mix, 100%% VRAM\n", prog);
+    printf("  %s -p hgemm -m 80%%          # FP16 acc Tensor Core, 80%% VRAM\n", prog);
+    printf("  %s -p sgemm                  # FP32 SGEMM\n", prog);
     printf("  %s -m 0.1%%                  # 매우 작은 GEMM (낮은 부하)\n", prog);
     printf("  %s -g 0,1 -i 4 -t 120      # GPU 0,1, 스트림 4개\n\n", prog);
 }
@@ -853,7 +895,7 @@ int main(int argc, char **argv)
     memset(&cfg, 0, sizeof(cfg));
     cfg.duration_sec        = 3600;
     cfg.intensity           = 1;
-    cfg.prec                = PREC_SGEMM;
+    cfg.prec                = PREC_HGEMM_MIX;
     cfg.mem_spec.is_percent = 1;
     cfg.mem_spec.value      = 100.0;
 
@@ -865,9 +907,11 @@ int main(int argc, char **argv)
         case 'i': cfg.intensity    = atoi(optarg);                       break;
         case 'm': cfg.mem_spec     = parse_mem_spec(optarg);             break;
         case 'p':
-            if      (!strcmp(optarg, "dgemm")) cfg.prec = PREC_DGEMM;
-            else if (!strcmp(optarg, "hgemm")) cfg.prec = PREC_HGEMM;
-            else                               cfg.prec = PREC_SGEMM;
+            if      (!strcmp(optarg, "dgemm"))     cfg.prec = PREC_DGEMM;
+            else if (!strcmp(optarg, "hgemm_mix")) cfg.prec = PREC_HGEMM_MIX;
+            else if (!strcmp(optarg, "hgemm"))     cfg.prec = PREC_HGEMM;
+            else if (!strcmp(optarg, "sgemm"))     cfg.prec = PREC_SGEMM;
+            else                                   cfg.prec = PREC_HGEMM_MIX;
             break;
         case 'g':
             cfg.num_gpus = parse_gpu_list(optarg, cfg.gpu_ids, MAX_GPUS);
@@ -909,7 +953,8 @@ int main(int argc, char **argv)
     const char *prec_str[] = {
         "SGEMM (FP32)",
         "DGEMM (FP64)",
-        "HGEMM (FP16, Tensor Core)"
+        "HGEMM (FP16 in / FP16 acc, Tensor Core)",
+        "HGEMM_MIX (FP16 in / FP32 acc, Tensor Core, mixed precision)"
     };
 
     /* ── 실행 설정 헤더 출력 ── */
@@ -962,9 +1007,10 @@ int main(int argc, char **argv)
         printf("\n");
 
         if (gc->core_info.cores_fp32 > 0)
-            printf("           Cores  FP32=%d / FP64=%d / Tensor=%d  (tc_ops=%d)\n",
+            printf("           Cores  FP32=%d / FP64=%d / Tensor=%d  (tc_ops=%d, tc_ops_mix=%d)\n",
                    gc->core_info.cores_fp32, gc->core_info.cores_fp64,
-                   gc->core_info.cores_tensor, gc->core_info.tc_ops);
+                   gc->core_info.cores_tensor,
+                   gc->core_info.tc_ops, gc->core_info.tc_ops_mix);
         else
             printf("           %s[주의] Core DB 미등록 GPU — 동적 Peak%% 표시 불가%s\n",
                    CLR_WARN, CLR_RESET);
@@ -1046,9 +1092,10 @@ int main(int argc, char **argv)
     /* ── 최종 결과 출력 ── */
     size_t bpe;
     switch (cfg.prec) {
-        case PREC_DGEMM: bpe = 8; break;
-        case PREC_HGEMM: bpe = 2; break;
-        default:         bpe = 4; break;
+        case PREC_DGEMM:     bpe = 8; break;
+        case PREC_HGEMM:
+        case PREC_HGEMM_MIX: bpe = 2; break;
+        default:             bpe = 4; break;
     }
 
     double grand_tflops = 0.0, grand_power = 0.0;
