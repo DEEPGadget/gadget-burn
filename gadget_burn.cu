@@ -579,14 +579,9 @@ static void worker_init(GemmWorker *w, int device_id,
     CUBLAS_CHECK(cublasCreate(&w->handle));
     CUBLAS_CHECK(cublasSetStream(w->handle, w->stream));
 
-    /* burn 모드 + sgemm_tf32: gpu-burn API 정확히 복제 (PRO 6000 SE 같은
-       워크스테이션 카드에서 driver의 "AI workload" boost policy를 트리거).
-       deprecated이지만 CUDA 12에서도 동작하며, cuBLAS heuristic이 다른
-       커널을 선택해 일반 compute 대비 더 높은 boost clock을 얻습니다. */
-    cublasMath_t math_mode = CUBLAS_DEFAULT_MATH;
-    if (prec == PREC_SGEMM_TF32 && num_c_buffers > 1)
-        math_mode = CUBLAS_TENSOR_OP_MATH;
-    CUBLAS_CHECK(cublasSetMathMode(w->handle, math_mode));
+    /* Modern API: cublasGemmEx에 compute type을 명시적으로 지정하므로
+       handle의 math mode는 cublasGemmEx에 무영향. DEFAULT로 고정. */
+    CUBLAS_CHECK(cublasSetMathMode(w->handle, CUBLAS_DEFAULT_MATH));
 
     CUDA_CHECK(cudaEventCreate(&w->ev_start));
     CUDA_CHECK(cudaEventCreate(&w->ev_stop));
@@ -682,23 +677,32 @@ static void run_gemm(GemmWorker *w)
     const int M = w->M, N = w->N, K = w->K;
     void *dC = current_c_ptr(w);
 
+    /* 모든 GEMM을 cublasGemmEx로 통일 (modern API).
+       compute type 및 data type을 명시적으로 지정 → cuBLAS heuristic이
+       deprecated cublasSetMathMode에 의존하지 않음. */
     switch (w->prec) {
     case PREC_SGEMM: {
         const float alpha = 1.f, beta = 0.f;
-        CUBLAS_CHECK(cublasSgemm(w->handle, CUBLAS_OP_N, CUBLAS_OP_N,
+        CUBLAS_CHECK(cublasGemmEx(
+            w->handle, CUBLAS_OP_N, CUBLAS_OP_N,
             M, N, K,
-            &alpha, (const float *)w->dA, M,
-                    (const float *)w->dB, K,
-            &beta,  (float *)dC, M));
+            &alpha, w->dA, CUDA_R_32F, M,
+                    w->dB, CUDA_R_32F, K,
+            &beta,  dC, CUDA_R_32F, M,
+            CUBLAS_COMPUTE_32F,        /* 순수 FP32, TC 미사용 */
+            CUBLAS_GEMM_DEFAULT));
         break;
     }
     case PREC_DGEMM: {
         const double alpha = 1.0, beta = 0.0;
-        CUBLAS_CHECK(cublasDgemm(w->handle, CUBLAS_OP_N, CUBLAS_OP_N,
+        CUBLAS_CHECK(cublasGemmEx(
+            w->handle, CUBLAS_OP_N, CUBLAS_OP_N,
             M, N, K,
-            &alpha, (const double *)w->dA, M,
-                    (const double *)w->dB, K,
-            &beta,  (double *)dC, M));
+            &alpha, w->dA, CUDA_R_64F, M,
+                    w->dB, CUDA_R_64F, K,
+            &beta,  dC, CUDA_R_64F, M,
+            CUBLAS_COMPUTE_64F,        /* FP64 */
+            CUBLAS_GEMM_DEFAULT));
         break;
     }
     case PREC_HGEMM: {
@@ -710,15 +714,14 @@ static void run_gemm(GemmWorker *w)
             &alpha, w->dA, CUDA_R_16F, M,
                     w->dB, CUDA_R_16F, K,
             &beta,  dC, CUDA_R_16F, M,
-            CUBLAS_COMPUTE_16F,
+            CUBLAS_COMPUTE_16F,        /* FP16 in/acc, Tensor Core */
             CUBLAS_GEMM_DEFAULT_TENSOR_OP));
         break;
     }
     case PREC_HGEMM_MIX: {
         /* FP16 입력/출력 storage + FP32 누산 (mixed precision)
-           compute=32F → scalar는 FP32. Tensor Core가 FP32 누산기 모드로 동작.
            이론 TFLOPS는 PREC_HGEMM의 1/2 (소비자/Pro급) 또는 동일 (서버급)이지만
-           실측 TDP가 가장 높아 burn-in 기본값으로 사용됩니다. */
+           실측 TDP가 가장 높아 burn-in 기본 정밀도로 사용됩니다. */
         const float alpha = 1.f, beta = 0.f;
         CUBLAS_CHECK(cublasGemmEx(
             w->handle, CUBLAS_OP_N, CUBLAS_OP_N,
@@ -726,38 +729,25 @@ static void run_gemm(GemmWorker *w)
             &alpha, w->dA, CUDA_R_16F, M,
                     w->dB, CUDA_R_16F, K,
             &beta,  dC, CUDA_R_16F, M,
-            CUBLAS_COMPUTE_32F,
+            CUBLAS_COMPUTE_32F,        /* FP16 in, FP32 acc — TC mixed precision */
             CUBLAS_GEMM_DEFAULT_TENSOR_OP));
         break;
     }
     case PREC_SGEMM_TF32: {
-        /* FP32 storage 그대로 + TF32 Tensor Core compute.
-           burn 모드(-x)에서는 gpu-burn API를 정확히 복제하여 워크스테이션 카드
-           (PRO 6000 SE 등)의 driver "AI workload" boost policy를 트리거합니다.
-           비 burn 모드에서는 modern explicit API를 사용해 이론치 측정에 최적. */
+        /* FP32 storage + TF32 Tensor Core compute.
+           CUBLAS_COMPUTE_32F_FAST_TF32 → 입력 FP32 mantissa를 TF32(19-bit)로
+           자르고 TC MMA로 가속, 누산은 FP32. Ampere(sm_80) 이상 필요.
+           burn 모드의 TDP 효과는 cuBLAS call 자체가 아니라 multi-C ring +
+           compare 커널 + random init에서 나옴 (call API는 통일). */
         const float alpha = 1.f, beta = 0.f;
-        if (w->num_c_buffers > 1) {
-            /* gpu-burn replica: cublasSgemm + CUBLAS_TENSOR_OP_MATH (worker_init에서 설정).
-               deprecated이지만 CUDA 12에서도 동작하며, cuBLAS heuristic이 일반
-               compute kernel과는 다른 path를 선택해 driver가 더 공격적인 boost 적용. */
-            CUBLAS_CHECK(cublasSgemm(w->handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                M, N, K,
-                &alpha, (const float *)w->dA, M,
-                        (const float *)w->dB, K,
-                &beta,  (float *)dC, M));
-        } else {
-            /* Modern explicit TF32 path.
-               CUBLAS_COMPUTE_32F_FAST_TF32 → 입력 FP32 mantissa를 TF32(19-bit)로
-               자르고 Tensor Core MMA로 가속, 누산은 FP32. Ampere(sm_80) 이상 필요. */
-            CUBLAS_CHECK(cublasGemmEx(
-                w->handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                M, N, K,
-                &alpha, w->dA, CUDA_R_32F, M,
-                        w->dB, CUDA_R_32F, K,
-                &beta,  dC, CUDA_R_32F, M,
-                CUBLAS_COMPUTE_32F_FAST_TF32,
-                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-        }
+        CUBLAS_CHECK(cublasGemmEx(
+            w->handle, CUBLAS_OP_N, CUBLAS_OP_N,
+            M, N, K,
+            &alpha, w->dA, CUDA_R_32F, M,
+                    w->dB, CUDA_R_32F, K,
+            &beta,  dC, CUDA_R_32F, M,
+            CUBLAS_COMPUTE_32F_FAST_TF32,
+            CUBLAS_GEMM_DEFAULT_TENSOR_OP));
         break;
     }
     }
