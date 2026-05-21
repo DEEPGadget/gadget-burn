@@ -127,10 +127,11 @@ typedef struct {
 static const CoreEntry CORE_TABLE[] = {
     /* Blackwell RTX PRO — GB202 full (188 SM)
        FP32=128/SM×188=24064, FP64=2/SM=376
-       소비자 다이(GB202) 공유. whitepaper는 풀스피드라 하지만 실측은 반속 → tc_ops_mix=128 */
-    { "RTX PRO 6000 Blackwell Server Edition", 24064, 376, 752, 256, 128 },
-    { "RTX PRO 6000 Blackwell Max-Q",          24064, 376, 752, 256, 128 },
-    { "RTX PRO 6000 Blackwell",                24064, 376, 752, 256, 128 },
+       whitepaper 명시대로 FP32 누산 페널티 없음 → tc_ops_mix = tc_ops = 256
+       (소비자 GB202와 다이 공유하지만 PRO 6000 Blackwell은 풀스피드 확인됨)  */
+    { "RTX PRO 6000 Blackwell Server Edition", 24064, 376, 752, 256, 256 },
+    { "RTX PRO 6000 Blackwell Max-Q",          24064, 376, 752, 256, 256 },
+    { "RTX PRO 6000 Blackwell",                24064, 376, 752, 256, 256 },
     /* Blackwell GeForce — GB202 (170 SM), GB203 (84 SM)
        FP64=2/SM (소비자급). HW 강제 반속 → tc_ops_mix = tc_ops/2          */
     { "GeForce RTX 5090",                      21760, 340, 680, 256, 128 },
@@ -140,9 +141,9 @@ static const CoreEntry CORE_TABLE[] = {
     { "GeForce RTX 4090",                      16384, 256, 512, 256, 128 },
     { "GeForce RTX 4080",                       9728, 152, 304, 256, 128 },
     /* Ada Professional / Data Center — AD102 full (142 SM)
-       RTX 6000 Ada/L40S도 AD102 공유. 실측 반속 가정 → tc_ops_mix=128     */
-    { "RTX 6000 Ada",                          18176, 284, 568, 256, 128 },
-    { "L40S",                                  18176, 284, 568, 256, 128 },
+       whitepaper 명시대로 FP32 누산 페널티 없음 → tc_ops_mix = tc_ops = 256 */
+    { "RTX 6000 Ada",                          18176, 284, 568, 256, 256 },
+    { "L40S",                                  18176, 284, 568, 256, 256 },
     /* Hopper — GH100 (132 SM for H200 NVL)
        FP64=64/SM=8448 (전용 코어). dense FP16 (acc=FP16 or FP32) = 989 TFLOPS
        per Hopper whitepaper: FP32 누산 페널티 없음 → tc_ops_mix = tc_ops  */

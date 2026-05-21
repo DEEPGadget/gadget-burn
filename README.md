@@ -139,8 +139,8 @@ GPU 등급에 따라 `hgemm_mix`의 이론 처리량이 달라집니다.
 | GPU 등급 | FP16/FP32 vs FP16/FP16 | 비고 |
 |---|---|---|
 | 서버 데이터센터 (A100, H100, H200) | **1:1 (페널티 없음)** | NVIDIA 데이터시트에 단일 FP16 Tensor Core 수치만 표기 |
+| Pro 워크스테이션 / 데이터센터 (RTX PRO 6000 Blackwell, RTX 6000 Ada, L40S) | **1:1 (페널티 없음)** | whitepaper 명시대로 풀스피드 |
 | 소비자 GeForce (RTX 30/40/50) | **1:2 (HW 강제 반속)** | Ada/Blackwell whitepaper 명시 |
-| Pro 워크스테이션 (RTX 6000 Ada, RTX PRO 6000 Blackwell) | **1:2 (실측 반속)** | 공식 spec은 풀스피드 주장이나 실측은 소비자급과 동일 |
 
 ---
 
@@ -270,18 +270,20 @@ FP16T_MIX Rpeak = Tensor_cores × tc_ops_mix  ops/cycle × clock_MHz × 1e-6  [T
 
 **`tc_ops_mix`** 는 같은 Tensor Core를 FP32 누산 모드(`CUBLAS_COMPUTE_32F`)로 사용했을 때의 처리량입니다.
 
-- **소비자 GeForce (RTX 30/40/50)** : HW에서 FP32 누산을 반속으로 강제하므로 `tc_ops_mix = tc_ops / 2 = 128`. 이것은 NVIDIA Ada/Blackwell whitepaper에서 명시한 제품 세그멘테이션 사양입니다.
-- **Pro 워크스테이션 (RTX 6000 Ada, RTX PRO 6000 Blackwell)** : NVIDIA 공식 spec은 풀스피드(`tc_ops_mix = tc_ops`)라 주장하지만, 동일 다이(AD102/GB202)를 공유하기 때문인지 **실측은 소비자급과 동일하게 반속**입니다. gadget_burn은 실측 동작 기준으로 `tc_ops_mix = 128`로 처리합니다.
+- **소비자 GeForce (RTX 30/40/50)** : HW에서 FP32 누산을 반속으로 강제하므로 `tc_ops_mix = tc_ops / 2 = 128`. NVIDIA Ada/Blackwell whitepaper에서 명시한 제품 세그멘테이션 사양입니다.
+- **Pro 워크스테이션 / 데이터센터 (RTX PRO 6000 Blackwell, RTX 6000 Ada, L40S)** : whitepaper 명시대로 FP32 누산 페널티가 없습니다. `tc_ops_mix = tc_ops = 256`.
 - **서버 데이터센터 (A100, H100, H200)** : Tensor Core에 FP32 누산 페널티가 없습니다. NVIDIA Hopper/Ampere DC whitepaper와 공식 데이터시트가 단일 FP16 Tensor Core 수치만 표기하는 이유입니다. `tc_ops_mix = tc_ops`.
 
 RTX 5090과 RTX 4090, H200 NVL의 공식 스펙으로 검증하면 다음과 같습니다.
 
 ```
-RTX 5090 (hgemm    ): 680 TC × 256  × 2407 MHz = 419.0 TFLOPS  ✓
-RTX 5090 (hgemm_mix): 680 TC × 128  × 2407 MHz = 209.5 TFLOPS  ✓ (whitepaper 명시 반속)
-RTX 4090 (hgemm    ): 512 TC × 256  × 2520 MHz = 330.3 TFLOPS  ✓
-H200 NVL (hgemm    ): 528 TC × 1024 × 1830 MHz = 989.5 TFLOPS  ✓ (dense, 데이터시트 ÷ 2 sparsity)
-H200 NVL (hgemm_mix): 528 TC × 1024 × 1830 MHz = 989.5 TFLOPS  ✓ (FP32 누산 페널티 없음)
+RTX 5090       (hgemm    ): 680 TC × 256  × 2407 MHz = 419.0 TFLOPS  ✓
+RTX 5090       (hgemm_mix): 680 TC × 128  × 2407 MHz = 209.5 TFLOPS  ✓ (whitepaper 명시 반속)
+RTX 4090       (hgemm    ): 512 TC × 256  × 2520 MHz = 330.3 TFLOPS  ✓
+RTX PRO 6000   (hgemm    ): 752 TC × 256  × 2617 MHz = 504.0 TFLOPS  ✓
+RTX PRO 6000   (hgemm_mix): 752 TC × 256  × 2617 MHz = 504.0 TFLOPS  ✓ (Blackwell Pro 풀스피드)
+H200 NVL       (hgemm    ): 528 TC × 1024 × 1830 MHz = 989.5 TFLOPS  ✓ (dense, 데이터시트 ÷ 2 sparsity)
+H200 NVL       (hgemm_mix): 528 TC × 1024 × 1830 MHz = 989.5 TFLOPS  ✓ (FP32 누산 페널티 없음)
 ```
 
 NVIDIA 스펙시트에는 동일 하드웨어에 대해 여러 수치가 병기되므로, 어떤 조건의 값인지 구분이 중요합니다.
@@ -411,19 +413,19 @@ GEMM 반복 (벤치 스레드, GPU 당 1개)
 
 | GPU | FP32 코어 | FP64 코어 | Tensor 코어 | tc_ops | tc_ops_mix |
 |---|---|---|---|---|---|
-| RTX PRO 6000 Blackwell (전 라인업) | 24,064 | 376 | 752 | 256 | 128 |
+| RTX PRO 6000 Blackwell (전 라인업) | 24,064 | 376 | 752 | 256 | 256 |
 | GeForce RTX 5090 | 21,760 | 340 | 680 | 256 | 128 |
 | GeForce RTX 5080 | 10,752 | 168 | 336 | 256 | 128 |
 | GeForce RTX 4090 | 16,384 | 256 | 512 | 256 | 128 |
 | GeForce RTX 4080 | 9,728 | 152 | 304 | 256 | 128 |
-| RTX 6000 Ada | 18,176 | 284 | 568 | 256 | 128 |
-| L40S | 18,176 | 284 | 568 | 256 | 128 |
+| RTX 6000 Ada | 18,176 | 284 | 568 | 256 | 256 |
+| L40S | 18,176 | 284 | 568 | 256 | 256 |
 | A100 | 6,912 | 3,456 | 432 | 512 | 512 |
 | H200 / H200 NVL | 16,896 | 8,448 | 528 | 1024 | 1024 |
 
 - `tc_ops`: FP16 입력 / FP16 누산 dense (`-p hgemm`) 시 TC 1개당 클럭당 ops
 - `tc_ops_mix`: FP16 입력 / FP32 누산 dense (`-p hgemm_mix`) 시 TC 1개당 클럭당 ops
-- 서버급(A100/H200)은 FP32 누산 페널티가 없어 두 값이 동일합니다. 소비자/Pro급은 HW 또는 실측 기준 반속이 적용됩니다.
+- 서버급(A100/H200) 및 Pro 라인업(RTX PRO 6000 Blackwell, RTX 6000 Ada, L40S)은 FP32 누산 페널티가 없어 두 값이 동일합니다. 소비자 GeForce만 HW 강제 반속이 적용됩니다.
 
 
 ## 라이선스
