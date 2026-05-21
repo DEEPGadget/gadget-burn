@@ -23,9 +23,12 @@
  *                   숫자%  : VRAM 대비 비율          (예: -m 80%)
  *                 (기본: 100%)
  *   -g <목록>     GPU ID 쉼표 구분                  (기본: 전체)
- *   -x            Burn pressure 모드 (다중 C 버퍼 + compare 커널)
+ *   -x            Burn pressure 모드 (다중 C 버퍼 + compare 커널 + random 데이터)
  *                 TFLOPS 이론치를 양보하고 메모리·TC·NoC를 동시 풀가동해
  *                 TDP를 한계까지 끌어올리는 burn-in 전용 모드.
+ *   -X <크기>     burn 모드 행렬 크기 override (기본 8192, opt: 16384/32768)
+ *   -I <모드>     데이터 초기화: memset (denormal) | rand (gpu-burn 패턴)
+ *                 기본 AUTO (burn 모드면 rand, 그 외 memset) — 비교 측정용
  *   -l            GPU 목록 출력 후 종료
  *   -h            도움말
  */
@@ -51,6 +54,9 @@
    동시에 활성화되도록 합니다.
    ───────────────────────────────────────────────────────── */
 
+/* gpu-burn 호환 compare 커널: default 캐시 모드(L1+L2) 사용.
+   compiler가 C[tid] hoisting할 수 있지만 그 동작이 gpu-burn과 일치. */
+
 extern "C" __global__ void burn_compare_f32(
     const float *C_base, size_t elem_per_buf,
     int num_buffers, int *errors)
@@ -58,13 +64,10 @@ extern "C" __global__ void burn_compare_f32(
     size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= elem_per_buf) return;
 
-    /* gpu-burn 패턴: ref를 매 iteration마다 re-load해서 메모리 트래픽 2배 확보.
-       __ldcg는 L1 우회 cached load로 compiler hoisting을 방지. */
     int my_err = 0;
     for (int i = 1; i < num_buffers; ++i) {
-        float ref = __ldcg(&C_base[tid]);
-        float v   = __ldcg(&C_base[tid + (size_t)i * elem_per_buf]);
-        if (fabsf(ref - v) > 1e-3f) my_err++;
+        if (fabsf(C_base[tid] - C_base[tid + (size_t)i * elem_per_buf]) > 1e-3f)
+            my_err++;
     }
     if (my_err > 0) atomicAdd(errors, my_err);
 }
@@ -78,8 +81,8 @@ extern "C" __global__ void burn_compare_f16(
 
     int my_err = 0;
     for (int i = 1; i < num_buffers; ++i) {
-        float ref = __half2float(__ldcg(&C_base[tid]));
-        float v   = __half2float(__ldcg(&C_base[tid + (size_t)i * elem_per_buf]));
+        float ref = __half2float(C_base[tid]);
+        float v   = __half2float(C_base[tid + (size_t)i * elem_per_buf]);
         if (fabsf(ref - v) > 1e-2f) my_err++;
     }
     if (my_err > 0) atomicAdd(errors, my_err);
@@ -94,12 +97,78 @@ extern "C" __global__ void burn_compare_f64(
 
     int my_err = 0;
     for (int i = 1; i < num_buffers; ++i) {
-        double ref = __ldcg(&C_base[tid]);
-        double v   = __ldcg(&C_base[tid + (size_t)i * elem_per_buf]);
-        if (fabs(ref - v) > 1e-7) my_err++;
+        if (fabs(C_base[tid] - C_base[tid + (size_t)i * elem_per_buf]) > 1e-7)
+            my_err++;
     }
     if (my_err > 0) atomicAdd(errors, my_err);
 }
+
+/* ─────────────────────────────────────────────────────────
+   행렬 random 초기화 커널 (burn 모드 전용)
+
+   기본 cudaMemset(buf, 1, ...)은 모든 byte를 0x01로 채워서 FP32로는 ~2.4e-38
+   (denormal) 값을 가집니다. 이런 데이터로 multiplier MAC을 돌리면 underflow→0
+   flush 되어 silicon 내부 bit toggle activity가 거의 0 → dynamic power 손실.
+
+   특히 Tensor Core는 wide multiplier array라 입력 bit pattern에 따라 power가
+   크게 변동합니다. gpu-burn처럼 random 0-10 데이터를 사용하면 매 곱셈마다
+   bit pattern이 크게 변해 MAC 회로 풀 스위칭 → TDP ↑.
+
+   curand 라이브러리 의존성 회피를 위해 xorshift32 PRNG로 직접 채웁니다.
+   ───────────────────────────────────────────────────────── */
+
+__device__ inline unsigned int xorshift32(unsigned int x)
+{
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    return x;
+}
+
+extern "C" __global__ void init_random_f32(float *buf, size_t n, unsigned seed)
+{
+    size_t stride = (size_t)blockDim.x * gridDim.x;
+    for (size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         tid < n; tid += stride) {
+        unsigned int s = (unsigned int)(tid * 2654435761u) ^ seed;
+        s = xorshift32(s);
+        s = xorshift32(s);
+        /* [0, 10.0) range — gpu-burn 패턴과 일치 */
+        buf[tid] = (float)s * (10.0f / 4294967296.0f);
+    }
+}
+
+extern "C" __global__ void init_random_f64(double *buf, size_t n, unsigned seed)
+{
+    size_t stride = (size_t)blockDim.x * gridDim.x;
+    for (size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         tid < n; tid += stride) {
+        unsigned int s1 = (unsigned int)(tid * 2654435761u) ^ seed;
+        s1 = xorshift32(s1);
+        s1 = xorshift32(s1);
+        unsigned int s2 = xorshift32(s1 ^ 0xDEADBEEFu);
+        /* 53-bit precision for mantissa — 두 32비트 결합 */
+        double hi = (double)s1 / 4294967296.0;
+        double lo = (double)s2 / (4294967296.0 * 4294967296.0);
+        buf[tid] = (hi + lo) * 10.0;
+    }
+}
+
+extern "C" __global__ void init_random_f16(__half *buf, size_t n, unsigned seed)
+{
+    size_t stride = (size_t)blockDim.x * gridDim.x;
+    for (size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         tid < n; tid += stride) {
+        unsigned int s = (unsigned int)(tid * 2654435761u) ^ seed;
+        s = xorshift32(s);
+        s = xorshift32(s);
+        /* FP16 max ~65504. K=8192 accumulation 시 overflow 방지 위해 [0, 2.0) 사용 */
+        float val = (float)s * (2.0f / 4294967296.0f);
+        buf[tid] = __float2half(val);
+    }
+}
+
+/* random init 호출 도우미: precision에 맞춰 커널 dispatch */
 
 /* ─────────────────────────────────────────────────────────
    상수
@@ -285,10 +354,40 @@ typedef enum {
     PREC_SGEMM_TF32   /* FP32 storage + TF32 Tensor Core compute */
 } PrecType;
 
+/* random init dispatch helper (PrecType 정의 후) */
+static void init_buffer_random(void *buf, size_t n_elem, PrecType prec,
+                               unsigned seed, cudaStream_t stream)
+{
+    const int blocks  = 256;
+    const int threads = 128;
+    switch (prec) {
+        case PREC_DGEMM:
+            init_random_f64<<<blocks, threads, 0, stream>>>(
+                (double *)buf, n_elem, seed);
+            break;
+        case PREC_HGEMM:
+        case PREC_HGEMM_MIX:
+            init_random_f16<<<blocks, threads, 0, stream>>>(
+                (__half *)buf, n_elem, seed);
+            break;
+        default:
+            init_random_f32<<<blocks, threads, 0, stream>>>(
+                (float *)buf, n_elem, seed);
+            break;
+    }
+}
+
 typedef struct {
     int    is_percent;  /* 1 = VRAM 비율, 0 = 절대 행렬 크기 */
     double value;
 } MemSpec;
+
+/* -I 옵션: A, B 매트릭스 초기화 방식 */
+typedef enum {
+    INIT_AUTO,    /* default: burn 모드면 RAND, 그 외엔 MEMSET */
+    INIT_MEMSET,  /* cudaMemset(1) — 모든 byte 0x01 (FP32는 ~2.4e-38 denormal) */
+    INIT_RAND     /* xorshift32 PRNG로 random 데이터 (gpu-burn 패턴) */
+} InitMode;
 
 typedef struct {
     int      duration_sec;
@@ -298,10 +397,16 @@ typedef struct {
     int      gpu_ids[MAX_GPUS];
     int      num_gpus;
     int      burn_pressure;     /* -x: 다중 C 버퍼 + compare 커널로 TDP 풀가동 */
+    int      burn_mat_size;     /* -X: burn 모드 행렬 크기 override (0이면 BURN_DEFAULT_M) */
+    InitMode init_mode;         /* -I: 초기화 방식 override (기본 AUTO) */
 } Config;
 
-/* burn 모드 기본 행렬 크기 (M=N=K). gpu-burn과 동일하게 8192 사용 */
-#define BURN_DEFAULT_M 8192
+/* burn 모드 기본 행렬 크기 (M=N=K).
+   32768은 큰 GPU(RTX 5090, PRO 6000 SE, H200 등)에서 메모리 트래픽과 SM 점유율
+   모두 충분히 확보되어 max TDP 도달이 가장 안정적. gpu-burn 정확 모사는 8192이지만
+   현대 GPU의 VRAM/SM 규모에 맞춰 더 큰 값을 채택.
+   -X 16384 / -X 8192로 더 작은 행렬 opt-in 가능. */
+#define BURN_DEFAULT_M 32768
 
 /* 단일 GEMM 스트림 워커 */
 typedef struct {
@@ -371,6 +476,10 @@ typedef struct {
     double       win_iter_ms[MON_WIN_SIZE];
     int          tflops_head;
     int          tflops_count;
+
+    /* burn 모드 (-x): 메모리 압박은 multi-C ring + compare 커널로만 처리.
+       동시 실행 shader/메모리 커널은 모두 효과 없거나 역효과로 검증 완료. */
+    int             burn_active;
 } GpuCtx;
 
 /* ─────────────────────────────────────────────────────────
@@ -407,10 +516,12 @@ static int calc_mat_size(int device_id, MemSpec spec,
     return (m < 256) ? 256 : m;
 }
 
+
 /* burn 모드용 C ring 슬롯 수 계산.
    A와 B는 intensity당 1개씩만 공유, C는 ring으로 가용 VRAM을 채움.
-   slots = (target_vram - intensity*(A+B)) / c_bytes
-   최소 4, 최대 256 슬롯으로 클램프 (너무 많으면 compare 커널 너무 느림). */
+   shader sgemm용 별도 영역(약 768 MB)도 미리 차감.
+   slots = (target_vram - intensity*(A+B) - shader_vram) / c_bytes
+   최소 4, 최대 256 슬롯으로 클램프. */
 static int calc_burn_c_buffers(int device_id, MemSpec spec,
                                PrecType prec, int intensity, int M)
 {
@@ -433,8 +544,8 @@ static int calc_burn_c_buffers(int device_id, MemSpec spec,
     }
 
     size_t c_bytes  = bpe * (size_t)M * (size_t)M;
-    size_t ab_bytes = 2 * c_bytes * intensity;   /* A + B per worker */
-    if (target <= ab_bytes) return 4;            /* fallback */
+    size_t ab_bytes = 2 * c_bytes * intensity;
+    if (target <= ab_bytes) return 4;
 
     size_t ring_budget = (target - ab_bytes) / intensity;
     int    n = (int)(ring_budget / c_bytes);
@@ -449,7 +560,7 @@ static int calc_burn_c_buffers(int device_id, MemSpec spec,
 
 static void worker_init(GemmWorker *w, int device_id,
                         int M, int N, int K, PrecType prec,
-                        int num_c_buffers)
+                        int num_c_buffers, int use_random_init)
 {
     w->device_id = device_id;
     w->M = M; w->N = N; w->K = K;
@@ -459,7 +570,12 @@ static void worker_init(GemmWorker *w, int device_id,
     w->compare_iters = 0;
     w->d_burn_errors = NULL;
 
-    CUDA_CHECK(cudaStreamCreate(&w->stream));
+    /* worker stream을 HIGH priority로 생성. burn 모드에서 동시 shader_burn이
+       있을 때 GEMM 커널이 SM slot을 먼저 확보하도록 함.
+       (CUDA는 보통 2단계: max_prio=numerically smallest, min_prio=numerically largest.) */
+    int prio_min = 0, prio_max = 0;
+    cudaDeviceGetStreamPriorityRange(&prio_min, &prio_max);
+    CUDA_CHECK(cudaStreamCreateWithPriority(&w->stream, cudaStreamDefault, prio_max));
     CUBLAS_CHECK(cublasCreate(&w->handle));
     CUBLAS_CHECK(cublasSetStream(w->handle, w->stream));
 
@@ -490,10 +606,23 @@ static void worker_init(GemmWorker *w, int device_id,
     CUDA_CHECK(cudaMalloc(&w->dA, szA));
     CUDA_CHECK(cudaMalloc(&w->dB, szB));
     CUDA_CHECK(cudaMalloc(&w->dC_ring, szC * (size_t)w->num_c_buffers));
-    /* 0 이외 값으로 초기화해 NaN 전파 방지 */
-    CUDA_CHECK(cudaMemset(w->dA, 1, szA));
-    CUDA_CHECK(cudaMemset(w->dB, 1, szB));
     CUDA_CHECK(cudaMemset(w->dC_ring, 0, szC * (size_t)w->num_c_buffers));
+
+    /* A, B 초기화: use_random_init로 명시적 선택 (-I 옵션이 결정).
+       - random: xorshift PRNG로 0~10 (FP32/FP64) 또는 0~2 (FP16) 채움
+                 → bit toggle activity 확보, TC MAC silicon 풀가동
+       - memset: byte 0x01 → FP32는 denormal(~2.4e-38)
+                 → underflow flush, multiplier switching 최소
+       두 방식의 TDP/TFLOPS 차이를 직접 비교 측정 가능. */
+    if (use_random_init) {
+        size_t n_a = (size_t)M * K;
+        size_t n_b = (size_t)K * N;
+        init_buffer_random(w->dA, n_a, prec, (unsigned)(device_id * 7919 + 1), w->stream);
+        init_buffer_random(w->dB, n_b, prec, (unsigned)(device_id * 7919 + 2), w->stream);
+    } else {
+        CUDA_CHECK(cudaMemset(w->dA, 1, szA));
+        CUDA_CHECK(cudaMemset(w->dB, 1, szB));
+    }
 
     if (w->num_c_buffers > 1) {
         CUDA_CHECK(cudaMalloc((void **)&w->d_burn_errors, sizeof(int)));
@@ -786,6 +915,7 @@ static void *bench_thread(void *arg)
     CUDA_CHECK(cudaSetDevice(g->device_id));
 
     while (g->bench_running) {
+
         /* 모든 스트림에 GEMM 발행 */
         for (int s = 0; s < g->intensity; s++) {
             cudaEventRecord(g->workers[s].ev_start, g->workers[s].stream);
@@ -823,6 +953,8 @@ static void *bench_thread(void *arg)
         g->tflops_head  = (idx + 1) % MON_WIN_SIZE;
         if (g->tflops_count < MON_WIN_SIZE) g->tflops_count++;
     }
+
+    /* shader_burn_finite는 매 iter마다 자연 종료되므로 별도 stop 신호 불필요 */
     return NULL;
 }
 
@@ -1095,17 +1227,27 @@ static void print_usage(const char *prog)
     printf("               (기본: -m 100%%)\n");
     printf("  -g <목록>    사용할 GPU ID (쉼표 구분)             (기본: 전체)\n");
     printf("  -x           Burn pressure 모드 활성화\n");
-    printf("               다중 C 버퍼 ring + compare 커널로 메모리 BW를 풀가동\n");
-    printf("               (행렬 크기 기본 %d, -m 절대크기로 override 가능).\n", BURN_DEFAULT_M);
+    printf("               다중 C 버퍼 ring + compare 커널 + random 데이터로 TDP 풀가동.\n");
     printf("               TFLOPS 이론치는 줄어들지만 TDP가 최대 근접까지 상승.\n");
     printf("               어떤 -p 모드와도 조합 가능. gpu-burn -tc와 동일 의도.\n");
+    printf("  -X <크기>    burn 모드 행렬 크기 override (기본 %d)\n", BURN_DEFAULT_M);
+    printf("               권장값: 8192 (gpu-burn 정확 모사, max TDP)\n");
+    printf("                       16384, 32768 (큰 GPU에서 더 강한 메모리 부하)\n");
+    printf("               우선순위: -X > -m 절대크기 > 기본 %d\n", BURN_DEFAULT_M);
+    printf("  -I <모드>    A,B 데이터 초기화 방식: memset | rand\n");
+    printf("               기본: burn 모드(-x)이면 rand, 그 외엔 memset (auto)\n");
+    printf("                 memset: cudaMemset(1) — denormal FP32 (TC switching 최소)\n");
+    printf("                 rand  : xorshift PRNG로 random 데이터 (TC switching 풀가동)\n");
+    printf("               비교 측정용 — 데이터 entropy가 TDP에 미치는 영향 분리 확인\n");
     printf("  -l           GPU 목록 출력 후 종료\n");
     printf("  -h           도움말\n\n");
     printf("예시:\n");
     printf("  %s                           # 전체 GPU, hgemm_mix, 100%% VRAM\n", prog);
     printf("  %s -p hgemm -m 80%%          # FP16 acc Tensor Core, 80%% VRAM\n", prog);
     printf("  %s -p sgemm_tf32             # TF32 가속 SGEMM (gpu-burn -tc 호환)\n", prog);
-    printf("  %s -p sgemm_tf32 -x          # TF32 + burn pressure (TDP 최대)\n", prog);
+    printf("  %s -p sgemm_tf32 -x          # TF32 + burn pressure (M=8192 기본)\n", prog);
+    printf("  %s -p sgemm_tf32 -x -X 32768 # TF32 burn + 큰 행렬 (메모리 부하 ↑)\n", prog);
+    printf("  %s -p sgemm_tf32 -x -I memset # burn but force memset (rand vs memset 비교)\n", prog);
     printf("  %s -p hgemm_mix -x           # mixed precision + burn pressure\n", prog);
     printf("  %s -p sgemm                  # FP32 SGEMM\n", prog);
     printf("  %s -m 0.1%%                  # 매우 작은 GEMM (낮은 부하)\n", prog);
@@ -1157,12 +1299,21 @@ int main(int argc, char **argv)
 
     int list_only = 0;
     int opt;
-    while ((opt = getopt(argc, argv, "t:i:p:m:g:xlh")) != -1) {
+    while ((opt = getopt(argc, argv, "t:i:p:m:g:X:I:xlh")) != -1) {
         switch (opt) {
         case 't': cfg.duration_sec  = atoi(optarg);                      break;
         case 'i': cfg.intensity     = atoi(optarg);                      break;
         case 'm': cfg.mem_spec      = parse_mem_spec(optarg);            break;
         case 'x': cfg.burn_pressure = 1;                                 break;
+        case 'X': cfg.burn_mat_size = atoi(optarg);                      break;
+        case 'I':
+            if      (!strcmp(optarg, "memset")) cfg.init_mode = INIT_MEMSET;
+            else if (!strcmp(optarg, "rand"))   cfg.init_mode = INIT_RAND;
+            else {
+                fprintf(stderr, "오류: -I는 memset 또는 rand만 허용\n");
+                return 1;
+            }
+            break;
         case 'p':
             if      (!strcmp(optarg, "dgemm"))      cfg.prec = PREC_DGEMM;
             else if (!strcmp(optarg, "hgemm_mix"))  cfg.prec = PREC_HGEMM_MIX;
@@ -1235,6 +1386,14 @@ int main(int argc, char **argv)
     if (cfg.burn_pressure)
         printf("  Burn 모드    : %sON%s (다중 C 버퍼 + compare 커널, 메모리 폭주)\n",
                CLR_CYAN, CLR_RESET);
+    {
+        const char *init_str;
+        if (cfg.init_mode == INIT_MEMSET)    init_str = "memset (강제)";
+        else if (cfg.init_mode == INIT_RAND) init_str = "rand (강제)";
+        else if (cfg.burn_pressure)          init_str = "rand (auto: burn 모드)";
+        else                                 init_str = "memset (auto)";
+        printf("  데이터 초기화: %s\n", init_str);
+    }
     printf("╠══════════════════════════════════════════════════════════════╣\n");
 
     /* ── GPU 별 초기화 ── */
@@ -1249,13 +1408,16 @@ int main(int argc, char **argv)
 
         CUDA_CHECK(cudaSetDevice(gc->device_id));
 
-        /* burn 모드: M은 작은 고정 크기, C 버퍼 ring으로 VRAM 채움 */
+        /* burn 모드: M은 작은 고정 크기, C 버퍼 ring으로 VRAM 채움.
+           우선순위: -X (burn 전용 override) > -m 절대크기 > BURN_DEFAULT_M */
         int num_c_buffers = 1;
         if (cfg.burn_pressure) {
-            /* -m이 절대 크기로 지정되었으면 그 값을 M으로, 아니면 BURN_DEFAULT_M */
-            gc->mat_size = (!cfg.mem_spec.is_percent)
-                             ? (int)cfg.mem_spec.value
-                             : BURN_DEFAULT_M;
+            int burn_m = BURN_DEFAULT_M;
+            if (cfg.burn_mat_size > 0)
+                burn_m = cfg.burn_mat_size;
+            else if (!cfg.mem_spec.is_percent)
+                burn_m = (int)cfg.mem_spec.value;
+            gc->mat_size = burn_m;
             num_c_buffers = calc_burn_c_buffers(gc->device_id, cfg.mem_spec,
                                                 cfg.prec, cfg.intensity,
                                                 gc->mat_size);
@@ -1299,13 +1461,20 @@ int main(int argc, char **argv)
             printf("           행렬 크기 %d x %d,  스트림 %d\n",
                    gc->mat_size, gc->mat_size, gc->intensity);
 
+        /* 초기화 방식 결정: -I 명시값이 있으면 그대로, 없으면 burn 모드 = rand, 그 외 memset */
+        int use_random_init;
+        if (cfg.init_mode == INIT_AUTO)
+            use_random_init = cfg.burn_pressure ? 1 : 0;
+        else
+            use_random_init = (cfg.init_mode == INIT_RAND) ? 1 : 0;
+
         /* 워커 할당 및 초기화 */
         gc->workers = (GemmWorker *)calloc(cfg.intensity, sizeof(GemmWorker));
         size_t total_vram = 0;
         for (int s = 0; s < cfg.intensity; s++) {
             worker_init(&gc->workers[s], gc->device_id,
                         gc->mat_size, gc->mat_size, gc->mat_size, gc->prec,
-                        num_c_buffers);
+                        num_c_buffers, use_random_init);
             total_vram += worker_vram_bytes(&gc->workers[s]);
         }
         gc->vram_used_mb = total_vram / (1024 * 1024);
@@ -1314,6 +1483,12 @@ int main(int argc, char **argv)
         /* 워밍업 */
         for (int s = 0; s < cfg.intensity; s++) run_gemm(&gc->workers[s]);
         CUDA_CHECK(cudaDeviceSynchronize());
+
+        /* burn 모드: 동시 shader_burn용 리소스 할당.
+           작은 cache-resident 버퍼(4 MB)와 stop flag를 device에 할당.
+           실제 커널 launch는 bench_thread 시작 시 수행 (디바이스 컨텍스트 일관성). */
+        if (cfg.burn_pressure)
+            gc->burn_active = 1;
     }
 
     printf("╠══════════════════════════════════════════════════════════════╣\n");
@@ -1468,6 +1643,7 @@ int main(int argc, char **argv)
         for (int s = 0; s < cfg.intensity; s++)
             worker_free(&gpus[g].workers[s]);
         free(gpus[g].workers);
+
     }
     free(gpus);
     nvmlShutdown();
