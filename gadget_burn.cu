@@ -244,6 +244,38 @@ static const CoreEntry CORE_TABLE[] = {
     /* Ampere DC — GA100, FP32 누산 페널티 없음
        FP16 dense = 312 TFLOPS, TF32 dense = 156 TFLOPS @ 1410 MHz → 256   */
     { "A100",                                   6912, 3456, 432,  512,  512,  256 },
+    /* Ampere Pro — RTX A-series, GA102/GA104. Pro 풀스피드 (FP32 acc 페널티 없음).
+       FP64=2/SM (1/64 of FP32, 소비자급 비율). ops: 256/256/128             */
+    { "RTX A6000",                             10752,  168, 336,  256,  256,  128 },
+    { "RTX A5000",                              8192,  128, 256,  256,  256,  128 },
+    { "RTX A4000",                              6144,   96, 192,  256,  256,  128 },
+    /* Ampere GeForce — GA102 (84 SM), GA104 (48 SM), GA106 (28 SM)
+       FP64=2/SM (소비자급). 소비자 페널티 적용: ops 256/128/64
+       Ti 변형은 더 구체적이므로 일반 변형보다 먼저 배치 (substring matching) */
+    { "GeForce RTX 3090 Ti",                   10752,  168, 336,  256,  128,   64 },
+    { "GeForce RTX 3090",                      10496,  164, 328,  256,  128,   64 },
+    { "GeForce RTX 3080 Ti",                   10240,  160, 320,  256,  128,   64 },
+    { "GeForce RTX 3080",                       8704,  136, 272,  256,  128,   64 },
+    { "GeForce RTX 3070 Ti",                    6144,   96, 192,  256,  128,   64 },
+    { "GeForce RTX 3070",                       5888,   92, 184,  256,  128,   64 },
+    { "GeForce RTX 3060 Ti",                    4864,   76, 152,  256,  128,   64 },
+    { "GeForce RTX 3060",                       3584,   56, 112,  256,  128,   64 },
+    { "GeForce RTX 3050",                       2560,   40,  80,  256,  128,   64 },
+    /* Turing Pro (Quadro RTX) — TU102 full / TU104
+       2nd gen TC, TF32 미지원 (tc_ops_tf32 = 0).
+       RTX 8000/6000은 compute 동일 (VRAM만 다름)                            */
+    { "Quadro RTX 8000",                        4608,  144, 576,  128,  128,    0 },
+    { "Quadro RTX 6000",                        4608,  144, 576,  128,  128,    0 },
+    { "Quadro RTX 5000",                        3072,   96, 384,  128,  128,    0 },
+    /* Turing GeForce/Titan — TU102 cut (68 SM) / TU102 full (72 SM) / TU104 (46 SM)
+       2nd gen TC, TF32 미지원. FP32 acc 페널티 없음 (소비자 페널티는 Ampere부터). */
+    { "GeForce RTX 2080 Ti",                    4352,  136, 544,  128,  128,    0 },
+    { "Titan RTX",                              4608,  144, 576,  128,  128,    0 },
+    { "GeForce RTX 2080",                       2944,   92, 368,  128,  128,    0 },
+    /* Volta DC — GV100 (80 SM), 1st gen TC, FP16 input only, TF32 미지원.
+       FP64=32/SM=2560 (1:2 of FP32, DC 풀 FP64). "Tesla V100"이 "V100"보다 먼저. */
+    { "Tesla V100",                             5120, 2560, 640,  128,  128,    0 },
+    { "V100",                                   5120, 2560, 640,  128,  128,    0 },
     /* sentinel */
     { NULL, 0, 0, 0, 0, 0, 0 }
 };
@@ -397,6 +429,8 @@ typedef struct {
     double       sum_clock;
     long         mon_samples;
     long         util_samples;
+    long         throttle_thermal_samples;     /* SW/HW thermal slowdown 감지 횟수 */
+    long         throttle_powerbrake_samples;  /* HW power brake 감지 횟수 */
 
     /* 슬라이딩 윈도우 (실시간 표시용, 원형 버퍼) */
     double       win_power[MON_WIN_SIZE];
@@ -409,6 +443,7 @@ typedef struct {
     volatile unsigned int cur_temp;
     volatile unsigned int cur_util;
     volatile unsigned int cur_clock;
+    volatile unsigned long long cur_throttle_reasons;  /* NVML throttle bitmask */
 
     /* 벤치 스레드 */
     GemmWorker  *workers;
@@ -742,6 +777,19 @@ static void *monitor_thread(void *arg)
             g->cur_clock  = clk;
         }
 
+        /* Throttle reasons (CUDA 12.5+ 에서 EventReasons로 rename, 구버전 함수도 유효).
+           SW Power Cap은 burn 모드에서 의도된 동작이라 별도 추적 안 함.
+           HW Slowdown 우산 flag도 thermal/power brake 둘 중 하나가 같이 set되면 자동 카운트됨. */
+        unsigned long long reasons = 0;
+        if (nvmlDeviceGetCurrentClocksThrottleReasons(g->nvml_dev, &reasons) == NVML_SUCCESS) {
+            g->cur_throttle_reasons = reasons;
+            if (reasons & (nvmlClocksThrottleReasonSwThermalSlowdown
+                         | nvmlClocksThrottleReasonHwThermalSlowdown))
+                g->throttle_thermal_samples++;
+            if (reasons & nvmlClocksThrottleReasonHwPowerBrakeSlowdown)
+                g->throttle_powerbrake_samples++;
+        }
+
         g->mon_samples++;
 
         /* 슬라이딩 윈도우 갱신 (원형 버퍼) */
@@ -892,6 +940,11 @@ static double calc_dynamic_rpeak(const GpuCtx *gc, PrecType prec, double clock_m
             return gc->core_info.cores_tensor
                    * (double)gc->core_info.tc_ops_mix * clock_mhz * 1e-6;
         case PREC_SGEMM_TF32:
+            /* TF32 미지원 GPU (Turing/Volta, tc_ops_tf32=0)에서는 cuBLAS가 자동으로
+               FP32 SGEMM으로 fallback. 실제 workload는 FP32 shader이므로 Peak%도
+               FP32 shader Rpeak 기준으로 보여줘야 정확. */
+            if (gc->core_info.tc_ops_tf32 == 0)
+                return gc->core_info.cores_fp32 * 2.0 * clock_mhz * 1e-6;
             return gc->core_info.cores_tensor
                    * (double)gc->core_info.tc_ops_tf32 * clock_mhz * 1e-6;
         case PREC_SGEMM:
@@ -933,9 +986,10 @@ static void print_progress(int elapsed, int total,
          Util%   :  6열  sep "------"          data " 98.8%"
          Clock   :  7열  sep "-------"         data "2635MHz"
          온도     :  5열  sep "-----"           data " 66°C"
+         Throt   :  5열  sep "-----"           data "  -  " / "THERM" / "  PWR"
          VRAM    :  9열  sep "---------"       data "30906 MiB"   */
 
-    printf("  %s  %s  %s  %s  %s  %s  %s  %s  %s\n",
+    printf("  %s  %s  %s  %s  %s  %s  %s  %s  %s  %s\n",
            " GPU  ",                           /*  6열 */
            "TFLOPS ",                          /*  7열 */
            "  Peak% (Rpeak) ",                  /* 15열 */
@@ -944,11 +998,12 @@ static void print_progress(int elapsed, int total,
            "Util% ",                           /*  6열 */
            " Clock ",                          /*  7열 */
            "\xec\x98\xa8\xeb\x8f\x84 ",        /*  5열 "온도 " */
+           "Throt",                            /*  5열 */
            "  VRAM   ");                       /*  9열 */
 
-    printf("  %s  %s  %s  %s  %s  %s  %s  %s  %s\n",
+    printf("  %s  %s  %s  %s  %s  %s  %s  %s  %s  %s\n",
            "------", "-------", "---------------",
-           "---------", "------", "------", "-------", "-----", "---------");
+           "---------", "------", "------", "-------", "-----", "-----", "---------");
 
     /* GPU 행 */
     for (int g = 0; g < num_gpus; g++) {
@@ -988,7 +1043,24 @@ static void print_progress(int elapsed, int total,
         const char *rc = (rpeak > 0.0) ? rpeak_color(tflops / rpeak * 100.0) : "";
         const char *tc = temp_color((double)gc->cur_temp);
 
-        printf("  GPU %2d  %7.3f  %s%13s%s  %7.1f W  %6s  %5.1f%%  %4uMHz  %s%5s%s  %5zu MiB\n",
+        /* Throttle 표시 (5열): THERM (열) > PWR (전력 brake) > "  -  " (없음)
+           우선순위는 thermal > power brake. SW Power Cap은 의도된 상태라 표시 안 함. */
+        const char *throt_str;
+        const char *throt_color;
+        unsigned long long r = gc->cur_throttle_reasons;
+        if (r & (nvmlClocksThrottleReasonSwThermalSlowdown
+               | nvmlClocksThrottleReasonHwThermalSlowdown)) {
+            throt_str   = "THERM";
+            throt_color = CLR_RED;
+        } else if (r & nvmlClocksThrottleReasonHwPowerBrakeSlowdown) {
+            throt_str   = "  PWR";
+            throt_color = CLR_YELLOW;
+        } else {
+            throt_str   = "  -  ";
+            throt_color = "";
+        }
+
+        printf("  GPU %2d  %7.3f  %s%13s%s  %7.1f W  %6s  %5.1f%%  %4uMHz  %s%5s%s  %s%s%s  %5zu MiB\n",
                gc->device_id,
                tflops,
                rc, peak_buf, CLR_RESET,
@@ -997,6 +1069,7 @@ static void print_progress(int elapsed, int total,
                util,
                clk,
                tc, temp_buf, CLR_RESET,
+               throt_color, throt_str, CLR_RESET,
                gc->vram_used_mb);
     }
     fflush(stdout);
@@ -1275,6 +1348,14 @@ int main(int argc, char **argv)
             printf("           %s[주의] Core DB 미등록 GPU — 동적 Peak%% 표시 불가%s\n",
                    CLR_WARN, CLR_RESET);
 
+        /* TF32 미지원 GPU에서 sgemm_tf32 실행 시 cuBLAS fallback 안내 */
+        if (cfg.prec == PREC_SGEMM_TF32
+            && gc->core_info.cores_fp32 > 0
+            && gc->core_info.tc_ops_tf32 == 0)
+            printf("           %s[참고] TF32 미지원 → cuBLAS가 FP32 SGEMM으로 자동 fallback "
+                   "(Peak%% 기준도 FP32 shader)%s\n",
+                   CLR_WARN, CLR_RESET);
+
         printf("           행렬 크기 %d x %d,  스트림 %d,  %sC ring %d 슬롯%s\n",
                gc->mat_size, gc->mat_size, gc->intensity,
                CLR_CYAN, num_c_buffers, CLR_RESET);
@@ -1415,6 +1496,23 @@ int main(int argc, char **argv)
                avg_clock, gc->cur_clock);
         printf("    ├ 평균 온도    : %s%.1f°C%s  (종료 시 %u°C)\n",
                temp_color(avg_temp), avg_temp, CLR_RESET, gc->cur_temp);
+
+        /* Throttle 누적: 100ms 폴링 기준 → samples × 0.1초 */
+        if (gc->mon_samples > 0) {
+            double th_sec  = gc->throttle_thermal_samples * 0.1;
+            double pwr_sec = gc->throttle_powerbrake_samples * 0.1;
+            double th_pct  = (double)gc->throttle_thermal_samples
+                             / gc->mon_samples * 100.0;
+            double pwr_pct = (double)gc->throttle_powerbrake_samples
+                             / gc->mon_samples * 100.0;
+            const char *th_col  = (th_sec  > 0.0) ? CLR_RED    : "";
+            const char *pwr_col = (pwr_sec > 0.0) ? CLR_YELLOW : "";
+            printf("    ├ Throttle    : %s열 %.1f초 (%.1f%%)%s, "
+                   "%s전력 %.1f초 (%.1f%%)%s\n",
+                   th_col,  th_sec,  th_pct,  (th_sec  > 0.0) ? CLR_RESET : "",
+                   pwr_col, pwr_sec, pwr_pct, (pwr_sec > 0.0) ? CLR_RESET : "");
+        }
+
         printf("    ├ 메모리 BW    : %.3f TB/s (추정)\n", membw);
         printf("    └ 전력 효율    : %.4f TFLOPS/W\n", eff);
 
