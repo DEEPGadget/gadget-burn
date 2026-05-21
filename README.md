@@ -107,9 +107,10 @@ FP32      Rpeak = FP32_cores   × 2           × clock_MHz × 1e-6  [TFLOPS]
 FP64      Rpeak = FP64_cores   × 2           × clock_MHz × 1e-6  [TFLOPS]
 FP16T     Rpeak = Tensor_cores × tc_ops      × clock_MHz × 1e-6  [TFLOPS]
 FP16T_MIX Rpeak = Tensor_cores × tc_ops_mix  × clock_MHz × 1e-6  [TFLOPS]
+TF32      Rpeak = Tensor_cores × tc_ops_tf32 × clock_MHz × 1e-6  [TFLOPS]
 ```
 
-`tc_ops`는 FP16 입력/FP16 누산 dense 모드의 TC당 클럭당 처리량, `tc_ops_mix`는 FP16 입력/FP32 누산 dense 모드의 처리량입니다. 소비자/Pro급 GPU는 `tc_ops_mix = tc_ops / 2`이지만, 서버급(A100/H100/H200)은 누산 페널티가 없어 `tc_ops_mix = tc_ops`입니다. 자세한 표는 [지원 GPU 목록](#지원-gpu-목록)을 참고하세요.
+`tc_ops`는 FP16 입력/FP16 누산 dense 모드, `tc_ops_mix`는 FP16 입력/FP32 누산 dense 모드, `tc_ops_tf32`는 TF32(FP32 storage + TF32 compute) dense 모드의 TC당 클럭당 처리량입니다. 소비자급은 두 종류의 페널티가 누적되어 `tc_ops_tf32 = tc_ops / 4`이고, Pro·서버급은 `tc_ops_tf32 = tc_ops / 2`입니다. 자세한 표는 [지원 GPU 목록](#지원-gpu-목록)을 참고하세요.
 
 고정값 방식에서는 Boost Clock이 스펙을 초과하면 Peak%가 100%를 넘어 비정상처럼 보이는 문제가 있었습니다. 동적 방식은 클럭 변동이 즉시 반영되어 "현재 클럭 대비 얼마나 효율적으로 동작하는가"를 정확히 나타냅니다.
 
@@ -131,16 +132,23 @@ FP16T_MIX Rpeak = Tensor_cores × tc_ops_mix  × clock_MHz × 1e-6  [TFLOPS]
 | `-p dgemm` | FP64 | `cublasDgemm` |
 | `-p hgemm` | FP16 입력 / FP16 누산 Tensor Core | `cublasGemmEx` + `CUBLAS_COMPUTE_16F` + `TENSOR_OP` |
 | `-p hgemm_mix` **(기본값)** | FP16 입력 / FP32 누산 Tensor Core | `cublasGemmEx` + `CUBLAS_COMPUTE_32F` + `TENSOR_OP` |
+| `-p sgemm_tf32` | FP32 storage + TF32 Tensor Core compute | `cublasGemmEx` + `CUBLAS_COMPUTE_32F_FAST_TF32` + `TENSOR_OP` |
 
 `hgemm_mix`(mixed precision)을 기본값으로 사용합니다. NVIDIA Tensor Core가 FP32 누산 모드로 동작할 때 실측 TDP가 가장 높게 측정되기 때문입니다. 이론 피크 TFLOPS는 `hgemm`(FP16 누산)이 더 높지만, burn-in 도구의 목적인 "전력·열 부하 극대화" 관점에서는 `hgemm_mix`가 더 효과적입니다.
 
-GPU 등급에 따라 `hgemm_mix`의 이론 처리량이 달라집니다.
+`sgemm_tf32`는 [gpu-burn](https://github.com/wilicc/gpu-burn)의 `-tc` 옵션과 동일한 의도의 burn-in 모드입니다. A·B·C 매트릭스를 **FP32 storage 그대로** 두고, Tensor Core가 입력 mantissa를 TF32(19-bit)로 잘라 가속한 뒤 결과는 FP32로 누산합니다. FP32 메모리 대역폭 부하(매 iteration마다 풀 FP32 매트릭스 read/write) + TC compute 부하 + FP32 누산 회로가 동시에 활성화되어 회로 전체에 전류를 흘리는 효과가 있습니다. Ampere(sm_80) 이상에서만 TF32 가속이 동작하며, 그 이하는 일반 FP32로 폴백합니다.
 
-| GPU 등급 | FP16/FP32 vs FP16/FP16 | 비고 |
-|---|---|---|
-| 서버 데이터센터 (A100, H100, H200) | **1:1 (페널티 없음)** | NVIDIA 데이터시트에 단일 FP16 Tensor Core 수치만 표기 |
-| Pro 워크스테이션 / 데이터센터 (RTX PRO 6000 Blackwell, RTX 6000 Ada, L40S) | **1:1 (페널티 없음)** | whitepaper 명시대로 풀스피드 |
-| 소비자 GeForce (RTX 30/40/50) | **1:2 (HW 강제 반속)** | Ada/Blackwell whitepaper 명시 |
+GPU 등급에 따라 Tensor Core 정밀도별 이론 처리량 비율이 달라집니다 (`hgemm` 기준 대비).
+
+| GPU 등급 | hgemm (FP16/16) | hgemm_mix (FP16/32) | sgemm_tf32 |
+|---|---|---|---|
+| 서버 DC (B200, Blackwell) | 1× (2048 ops) | 1× (페널티 없음) | 1/2× (1024 ops) |
+| 서버 DC (H100, H200, Hopper) | 1× (1024 ops) | 1× (페널티 없음) | 1/2× (512 ops) |
+| 서버 DC (A100, Ampere) | 1× (512 ops) | 1× (페널티 없음) | 1/2× (256 ops) |
+| Pro 워크스테이션 / DC (RTX PRO 6000 Blackwell, RTX 6000 Ada, L40S) | 1× (256 ops) | 1× (페널티 없음) | 1/2× (128 ops) |
+| 소비자 GeForce (RTX 30/40/50) | 1× (256 ops) | **1/2× (HW 강제 반속)** | **1/4× (이중 페널티, 64 ops)** |
+
+> NVIDIA는 데이터센터 세대마다 TC 1개당 ops를 2배씩 늘려왔습니다: A100(512) → H100/H200(1024) → B200(2048). 그러나 Pro·소비자 라인업은 Blackwell까지도 256으로 유지되었습니다.
 
 ---
 
@@ -204,7 +212,7 @@ make clean       # 빌드 파일 삭제
 |---|---|---|
 | `-t <초>` | 총 측정 시간 | `3600` |
 | `-i <강도>` | GPU 당 동시 GEMM 스트림 수 | `1` |
-| `-p <타입>` | `sgemm` / `dgemm` / `hgemm` / `hgemm_mix` | `hgemm_mix` |
+| `-p <타입>` | `sgemm` / `dgemm` / `hgemm` / `hgemm_mix` / `sgemm_tf32` | `hgemm_mix` |
 | `-m <값>` | 메모리 사용량 (`80%` 또는 `8192`) | `100%` |
 | `-g <목록>` | 사용할 GPU ID (쉼표 구분) | 전체 |
 | `-l` | GPU 목록 출력 후 종료 | — |
@@ -218,6 +226,9 @@ make clean       # 빌드 파일 삭제
 
 # FP16 누산 Tensor Core 이론 피크 TFLOPS 측정용
 ./gadget_burn -p hgemm -m 80% -t 7200
+
+# TF32 가속 SGEMM (gpu-burn -tc 호환, Ampere+ 필요)
+./gadget_burn -p sgemm_tf32
 
 # FP32 SGEMM (Tensor Core 미사용)
 ./gadget_burn -p sgemm
@@ -264,26 +275,36 @@ FP32      Rpeak = FP32_cores   × 2           ops/cycle × clock_MHz × 1e-6  [T
 FP64      Rpeak = FP64_cores   × 2           ops/cycle × clock_MHz × 1e-6  [TFLOPS]
 FP16T     Rpeak = Tensor_cores × tc_ops      ops/cycle × clock_MHz × 1e-6  [TFLOPS]
 FP16T_MIX Rpeak = Tensor_cores × tc_ops_mix  ops/cycle × clock_MHz × 1e-6  [TFLOPS]
+TF32      Rpeak = Tensor_cores × tc_ops_tf32 ops/cycle × clock_MHz × 1e-6  [TFLOPS]
 ```
 
 **`tc_ops = 256`** 은 Tensor Core 1개가 1 클럭 사이클에 처리하는 **FP16 입력 / FP16 누산 dense** FMA 연산 횟수입니다. 하나의 Tensor Core는 `16×16=256`개의 FMA를 1 MMA(Matrix Multiply-Accumulate) instruction으로 처리하며, NVIDIA Ada(4th gen)와 Blackwell(5th gen) 소비자·전문가급 RTX 라인업에서 이 값은 공통으로 **256**입니다. Hopper(H200)는 dense FP16 기준 **`tc_ops = 1024`**, A100(Ampere DC)는 **`tc_ops = 512`** 입니다.
 
 **`tc_ops_mix`** 는 같은 Tensor Core를 FP32 누산 모드(`CUBLAS_COMPUTE_32F`)로 사용했을 때의 처리량입니다.
 
-- **소비자 GeForce (RTX 30/40/50)** : HW에서 FP32 누산을 반속으로 강제하므로 `tc_ops_mix = tc_ops / 2 = 128`. NVIDIA Ada/Blackwell whitepaper에서 명시한 제품 세그멘테이션 사양입니다.
-- **Pro 워크스테이션 / 데이터센터 (RTX PRO 6000 Blackwell, RTX 6000 Ada, L40S)** : whitepaper 명시대로 FP32 누산 페널티가 없습니다. `tc_ops_mix = tc_ops = 256`.
-- **서버 데이터센터 (A100, H100, H200)** : Tensor Core에 FP32 누산 페널티가 없습니다. NVIDIA Hopper/Ampere DC whitepaper와 공식 데이터시트가 단일 FP16 Tensor Core 수치만 표기하는 이유입니다. `tc_ops_mix = tc_ops`.
+- **소비자 GeForce (RTX 30/40/50)** : HW에서 FP32 누산을 반속으로 강제하므로 `tc_ops_mix = tc_ops / 2 = 128`. TF32는 이중 페널티가 적용되어 `tc_ops_tf32 = tc_ops / 4 = 64`. NVIDIA Ada/Blackwell whitepaper에서 명시한 제품 세그멘테이션 사양입니다.
+- **Pro 워크스테이션 / 데이터센터 (RTX PRO 6000 Blackwell, RTX 6000 Ada, L40S)** : whitepaper 명시대로 FP32 누산 페널티가 없으며, `tc_ops_mix = tc_ops = 256`. TF32는 `tc_ops_tf32 = tc_ops / 2 = 128`.
+- **서버 데이터센터 (A100, H100, H200, B200)** : Tensor Core에 FP32 누산 페널티가 없습니다. `tc_ops_mix = tc_ops`, `tc_ops_tf32 = tc_ops / 2`. NVIDIA Ampere/Hopper/Blackwell DC whitepaper와 공식 데이터시트가 단일 FP16 Tensor Core 수치만 표기하는 이유입니다. 세대마다 base `tc_ops`가 2배씩 증가합니다 (A100=512 → H200=1024 → B200=2048).
 
 RTX 5090과 RTX 4090, H200 NVL의 공식 스펙으로 검증하면 다음과 같습니다.
 
 ```
-RTX 5090       (hgemm    ): 680 TC × 256  × 2407 MHz = 419.0 TFLOPS  ✓
-RTX 5090       (hgemm_mix): 680 TC × 128  × 2407 MHz = 209.5 TFLOPS  ✓ (whitepaper 명시 반속)
-RTX 4090       (hgemm    ): 512 TC × 256  × 2520 MHz = 330.3 TFLOPS  ✓
-RTX PRO 6000   (hgemm    ): 752 TC × 256  × 2617 MHz = 504.0 TFLOPS  ✓
-RTX PRO 6000   (hgemm_mix): 752 TC × 256  × 2617 MHz = 504.0 TFLOPS  ✓ (Blackwell Pro 풀스피드)
-H200 NVL       (hgemm    ): 528 TC × 1024 × 1830 MHz = 989.5 TFLOPS  ✓ (dense, 데이터시트 ÷ 2 sparsity)
-H200 NVL       (hgemm_mix): 528 TC × 1024 × 1830 MHz = 989.5 TFLOPS  ✓ (FP32 누산 페널티 없음)
+RTX 5090       (hgemm     ): 680 TC × 256  × 2407 MHz = 419.0 TFLOPS  ✓
+RTX 5090       (hgemm_mix ): 680 TC × 128  × 2407 MHz = 209.5 TFLOPS  ✓ (whitepaper 명시 반속)
+RTX 5090       (sgemm_tf32): 680 TC ×  64  × 2407 MHz = 104.8 TFLOPS  ✓ (이중 페널티)
+RTX 4090       (hgemm     ): 512 TC × 256  × 2520 MHz = 330.3 TFLOPS  ✓
+RTX 4090       (sgemm_tf32): 512 TC ×  64  × 2520 MHz =  82.6 TFLOPS  ✓
+RTX PRO 6000   (hgemm     ): 752 TC × 256  × 2617 MHz = 504.0 TFLOPS  ✓
+RTX PRO 6000   (hgemm_mix ): 752 TC × 256  × 2617 MHz = 504.0 TFLOPS  ✓ (Blackwell Pro 풀스피드)
+RTX PRO 6000   (sgemm_tf32): 752 TC × 128  × 2617 MHz = 252.0 TFLOPS  ✓
+A100           (hgemm     ): 432 TC × 512  × 1410 MHz = 311.9 TFLOPS  ✓ (dense)
+A100           (sgemm_tf32): 432 TC × 256  × 1410 MHz = 156.0 TFLOPS  ✓ (dense, NVIDIA spec)
+H200 NVL       (hgemm     ): 528 TC × 1024 × 1830 MHz = 989.5 TFLOPS  ✓ (dense, 데이터시트 ÷ 2 sparsity)
+H200 NVL       (hgemm_mix ): 528 TC × 1024 × 1830 MHz = 989.5 TFLOPS  ✓ (FP32 누산 페널티 없음)
+H200 NVL       (sgemm_tf32): 528 TC × 512  × 1830 MHz = 494.7 TFLOPS  ✓
+B200           (hgemm     ): 640 TC × 2048 × 1717 MHz = 2250  TFLOPS  ✓ (Blackwell DC, datasheet)
+B200           (hgemm_mix ): 640 TC × 2048 × 1717 MHz = 2250  TFLOPS  ✓
+B200           (sgemm_tf32): 640 TC × 1024 × 1717 MHz = 1125  TFLOPS  ✓
 ```
 
 NVIDIA 스펙시트에는 동일 하드웨어에 대해 여러 수치가 병기되므로, 어떤 조건의 값인지 구분이 중요합니다.
@@ -378,7 +399,7 @@ GEMM 반복 (벤치 스레드, GPU 당 1개)
 | 컬럼 | 측정 방법 | 표시 기준 |
 |---|---|---|
 | TFLOPS | `2×M×N×K×intensity×iters / time` | 슬라이딩 윈도우 (최근 10초) |
-| Peak%(Rpeak) | `TFLOPS / (TC × tc_ops[_mix] × clock) × 100` | 슬라이딩 윈도우 클럭 기준 |
+| Peak%(Rpeak) | `TFLOPS / (TC × tc_ops[_mix|_tf32] × clock) × 100` | 슬라이딩 윈도우 클럭 기준 |
 | 전력(W) | `nvmlDeviceGetPowerUsage` | 슬라이딩 윈도우 (최근 10초) |
 | TDP% | `전력 / TDP × 100` | 동일 |
 | Util% | `nvmlDeviceGetSamples` (GPU별 독립 버퍼) | 슬라이딩 윈도우 (최근 10초) |
@@ -411,21 +432,24 @@ GEMM 반복 (벤치 스레드, GPU 당 1개)
 
 내장 코어 DB에 등록된 GPU입니다. 미등록 GPU도 전력 측정 및 성능 평가는 정상적으로 진행되나 Peak% 표시 없이 TFLOPS 절댓값만 출력합니다.
 
-| GPU | FP32 코어 | FP64 코어 | Tensor 코어 | tc_ops | tc_ops_mix |
-|---|---|---|---|---|---|
-| RTX PRO 6000 Blackwell (전 라인업) | 24,064 | 376 | 752 | 256 | 256 |
-| GeForce RTX 5090 | 21,760 | 340 | 680 | 256 | 128 |
-| GeForce RTX 5080 | 10,752 | 168 | 336 | 256 | 128 |
-| GeForce RTX 4090 | 16,384 | 256 | 512 | 256 | 128 |
-| GeForce RTX 4080 | 9,728 | 152 | 304 | 256 | 128 |
-| RTX 6000 Ada | 18,176 | 284 | 568 | 256 | 256 |
-| L40S | 18,176 | 284 | 568 | 256 | 256 |
-| A100 | 6,912 | 3,456 | 432 | 512 | 512 |
-| H200 / H200 NVL | 16,896 | 8,448 | 528 | 1024 | 1024 |
+| GPU | FP32 코어 | FP64 코어 | Tensor 코어 | tc_ops | tc_ops_mix | tc_ops_tf32 |
+|---|---|---|---|---|---|---|
+| RTX PRO 6000 Blackwell (전 라인업) | 24,064 | 376 | 752 | 256 | 256 | 128 |
+| GeForce RTX 5090 | 21,760 | 340 | 680 | 256 | 128 | 64 |
+| GeForce RTX 5080 | 10,752 | 168 | 336 | 256 | 128 | 64 |
+| GeForce RTX 4090 | 16,384 | 256 | 512 | 256 | 128 | 64 |
+| GeForce RTX 4080 | 9,728 | 152 | 304 | 256 | 128 | 64 |
+| RTX 6000 Ada | 18,176 | 284 | 568 | 256 | 256 | 128 |
+| L40S | 18,176 | 284 | 568 | 256 | 256 | 128 |
+| A100 | 6,912 | 3,456 | 432 | 512 | 512 | 256 |
+| H200 / H200 NVL | 16,896 | 8,448 | 528 | 1024 | 1024 | 512 |
+| B200 | 20,480 | 10,240 | 640 | 2048 | 2048 | 1024 |
 
 - `tc_ops`: FP16 입력 / FP16 누산 dense (`-p hgemm`) 시 TC 1개당 클럭당 ops
 - `tc_ops_mix`: FP16 입력 / FP32 누산 dense (`-p hgemm_mix`) 시 TC 1개당 클럭당 ops
-- 서버급(A100/H200) 및 Pro 라인업(RTX PRO 6000 Blackwell, RTX 6000 Ada, L40S)은 FP32 누산 페널티가 없어 두 값이 동일합니다. 소비자 GeForce만 HW 강제 반속이 적용됩니다.
+- `tc_ops_tf32`: TF32 (FP32 storage + TF32 compute) dense (`-p sgemm_tf32`) 시 TC 1개당 클럭당 ops
+- Pro·서버급은 `tc_ops_mix = tc_ops`, `tc_ops_tf32 = tc_ops / 2` (단일 페널티)
+- 소비자 GeForce는 `tc_ops_mix = tc_ops / 2`, `tc_ops_tf32 = tc_ops / 4` (이중 페널티)
 
 
 ## 라이선스
