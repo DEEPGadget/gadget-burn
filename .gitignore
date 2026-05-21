@@ -1,0 +1,4 @@
+# 빌드 산물
+gadget_burn
+*.ptx
+*.o
