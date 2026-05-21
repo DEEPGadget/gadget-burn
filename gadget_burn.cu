@@ -58,10 +58,12 @@ extern "C" __global__ void burn_compare_f32(
     size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= elem_per_buf) return;
 
-    float ref = C_base[tid];
+    /* gpu-burn 패턴: ref를 매 iteration마다 re-load해서 메모리 트래픽 2배 확보.
+       __ldcg는 L1 우회 cached load로 compiler hoisting을 방지. */
     int my_err = 0;
     for (int i = 1; i < num_buffers; ++i) {
-        float v = C_base[tid + (size_t)i * elem_per_buf];
+        float ref = __ldcg(&C_base[tid]);
+        float v   = __ldcg(&C_base[tid + (size_t)i * elem_per_buf]);
         if (fabsf(ref - v) > 1e-3f) my_err++;
     }
     if (my_err > 0) atomicAdd(errors, my_err);
@@ -74,10 +76,10 @@ extern "C" __global__ void burn_compare_f16(
     size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= elem_per_buf) return;
 
-    float ref = __half2float(C_base[tid]);
     int my_err = 0;
     for (int i = 1; i < num_buffers; ++i) {
-        float v = __half2float(C_base[tid + (size_t)i * elem_per_buf]);
+        float ref = __half2float(__ldcg(&C_base[tid]));
+        float v   = __half2float(__ldcg(&C_base[tid + (size_t)i * elem_per_buf]));
         if (fabsf(ref - v) > 1e-2f) my_err++;
     }
     if (my_err > 0) atomicAdd(errors, my_err);
@@ -90,10 +92,10 @@ extern "C" __global__ void burn_compare_f64(
     size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= elem_per_buf) return;
 
-    double ref = C_base[tid];
     int my_err = 0;
     for (int i = 1; i < num_buffers; ++i) {
-        double v = C_base[tid + (size_t)i * elem_per_buf];
+        double ref = __ldcg(&C_base[tid]);
+        double v   = __ldcg(&C_base[tid + (size_t)i * elem_per_buf]);
         if (fabs(ref - v) > 1e-7) my_err++;
     }
     if (my_err > 0) atomicAdd(errors, my_err);
@@ -460,7 +462,16 @@ static void worker_init(GemmWorker *w, int device_id,
     CUDA_CHECK(cudaStreamCreate(&w->stream));
     CUBLAS_CHECK(cublasCreate(&w->handle));
     CUBLAS_CHECK(cublasSetStream(w->handle, w->stream));
-    CUBLAS_CHECK(cublasSetMathMode(w->handle, CUBLAS_DEFAULT_MATH));
+
+    /* burn 모드 + sgemm_tf32: gpu-burn API 정확히 복제 (PRO 6000 SE 같은
+       워크스테이션 카드에서 driver의 "AI workload" boost policy를 트리거).
+       deprecated이지만 CUDA 12에서도 동작하며, cuBLAS heuristic이 다른
+       커널을 선택해 일반 compute 대비 더 높은 boost clock을 얻습니다. */
+    cublasMath_t math_mode = CUBLAS_DEFAULT_MATH;
+    if (prec == PREC_SGEMM_TF32 && num_c_buffers > 1)
+        math_mode = CUBLAS_TENSOR_OP_MATH;
+    CUBLAS_CHECK(cublasSetMathMode(w->handle, math_mode));
+
     CUDA_CHECK(cudaEventCreate(&w->ev_start));
     CUDA_CHECK(cudaEventCreate(&w->ev_stop));
 
@@ -591,20 +602,33 @@ static void run_gemm(GemmWorker *w)
         break;
     }
     case PREC_SGEMM_TF32: {
-        /* FP32 storage 그대로 + TF32 Tensor Core compute
-           CUBLAS_COMPUTE_32F_FAST_TF32: 입력 FP32 mantissa를 TF32(19-bit)로 자르고
-           Tensor Core MMA로 가속, 누산은 FP32. SGEMM의 메모리 대역폭 부하 +
-           TC compute 부하가 동시에 걸려 burn-in 효과가 큽니다 (gpu-burn -tc 와 동일 의도).
-           Ampere(sm_80) 이상에서만 TF32 가속, 그 이하는 일반 FP32로 폴백.            */
+        /* FP32 storage 그대로 + TF32 Tensor Core compute.
+           burn 모드(-x)에서는 gpu-burn API를 정확히 복제하여 워크스테이션 카드
+           (PRO 6000 SE 등)의 driver "AI workload" boost policy를 트리거합니다.
+           비 burn 모드에서는 modern explicit API를 사용해 이론치 측정에 최적. */
         const float alpha = 1.f, beta = 0.f;
-        CUBLAS_CHECK(cublasGemmEx(
-            w->handle, CUBLAS_OP_N, CUBLAS_OP_N,
-            M, N, K,
-            &alpha, w->dA, CUDA_R_32F, M,
-                    w->dB, CUDA_R_32F, K,
-            &beta,  dC, CUDA_R_32F, M,
-            CUBLAS_COMPUTE_32F_FAST_TF32,
-            CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        if (w->num_c_buffers > 1) {
+            /* gpu-burn replica: cublasSgemm + CUBLAS_TENSOR_OP_MATH (worker_init에서 설정).
+               deprecated이지만 CUDA 12에서도 동작하며, cuBLAS heuristic이 일반
+               compute kernel과는 다른 path를 선택해 driver가 더 공격적인 boost 적용. */
+            CUBLAS_CHECK(cublasSgemm(w->handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                M, N, K,
+                &alpha, (const float *)w->dA, M,
+                        (const float *)w->dB, K,
+                &beta,  (float *)dC, M));
+        } else {
+            /* Modern explicit TF32 path.
+               CUBLAS_COMPUTE_32F_FAST_TF32 → 입력 FP32 mantissa를 TF32(19-bit)로
+               자르고 Tensor Core MMA로 가속, 누산은 FP32. Ampere(sm_80) 이상 필요. */
+            CUBLAS_CHECK(cublasGemmEx(
+                w->handle, CUBLAS_OP_N, CUBLAS_OP_N,
+                M, N, K,
+                &alpha, w->dA, CUDA_R_32F, M,
+                        w->dB, CUDA_R_32F, K,
+                &beta,  dC, CUDA_R_32F, M,
+                CUBLAS_COMPUTE_32F_FAST_TF32,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        }
         break;
     }
     }
