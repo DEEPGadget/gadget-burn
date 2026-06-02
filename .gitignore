@@ -2,3 +2,5 @@
 gadget_burn
 *.ptx
 *.o
+# HIP offload bundle 추출 부산물 (llvm-objdump --offloading)
+gadget_burn.0.*

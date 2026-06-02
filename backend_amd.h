@@ -1,0 +1,361 @@
+/**
+ * backend_amd.h  —  HIP / rocBLAS / amd_smi 백엔드 구현
+ * ─────────────────────────────────────────────────────────────
+ * gpu_backend.h 가 정의한 계약을 AMD ROCm SDK로 구현합니다.
+ *
+ *   Runtime  : HIP        (cuda* 호출을 hip* 로 매크로 별칭)
+ *   BLAS     : rocBLAS    (rocblas_gemm_ex, 직접 호출)
+ *   모니터링 : amd_smi    (NVML 대체)
+ *
+ * 본체(gadget_burn.cu)는 cuda* 이름을 그대로 사용하고, 이 헤더가 그것을
+ * hip* 로 치환합니다. 따라서 본체 소스는 벤더 중립으로 유지됩니다.
+ * ───────────────────────────────────────────────────────────── */
+
+#ifndef BACKEND_AMD_H
+#define BACKEND_AMD_H
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+#include <rocblas/rocblas.h>
+#include <amd_smi/amdsmi.h>
+
+/* AMD GPU 코어 DB (동적 Rpeak 계산용 GB_AMD_CORE_ENTRIES 매크로 제공).
+   본체 CORE_TABLE 안에서 #ifdef GB_BACKEND_AMD 로 펼쳐집니다. */
+#include "core_table_amd.h"
+
+/* ─────────────────────────────────────────────────────────
+   [1] CUDA Runtime → HIP 별칭
+   ─────────────────────────────────────────────────────────
+   본체가 사용하는 cuda* 심볼 전체를 hip* 로 매핑합니다.
+   (grep 으로 추출한 본체 사용 심볼 기준, 빠짐없이 1:1)
+   ───────────────────────────────────────────────────────── */
+
+/* 타입 */
+#define cudaError_t              hipError_t
+#define cudaStream_t             hipStream_t
+#define cudaEvent_t              hipEvent_t
+#define cudaDeviceProp           hipDeviceProp_t
+
+/* 상수 */
+#define cudaSuccess              hipSuccess
+
+/* 디바이스 / 메모리 */
+#define cudaSetDevice            hipSetDevice
+#define cudaGetDeviceCount       hipGetDeviceCount
+#define cudaGetDeviceProperties  hipGetDeviceProperties
+#define cudaDeviceSynchronize    hipDeviceSynchronize
+#define cudaMalloc               hipMalloc
+#define cudaFree                 hipFree
+#define cudaMemset               hipMemset
+#define cudaMemGetInfo           hipMemGetInfo
+#define cudaGetErrorString       hipGetErrorString
+
+/* 스트림 */
+#define cudaStreamCreate         hipStreamCreate
+#define cudaStreamDestroy        hipStreamDestroy
+#define cudaStreamSynchronize    hipStreamSynchronize
+
+/* 이벤트 */
+#define cudaEventCreate          hipEventCreate
+#define cudaEventDestroy         hipEventDestroy
+#define cudaEventRecord          hipEventRecord
+#define cudaEventElapsedTime     hipEventElapsedTime
+
+/* ─────────────────────────────────────────────────────────
+   GPU half 타입
+   HIP 도 __half / __float2half 를 native 제공
+   ───────────────────────────────────────────────────────── */
+typedef __half gb_half;
+static inline gb_half gb_float2half(float f) { return __float2half(f); }
+
+typedef hipStream_t gb_stream_t;
+
+/* ─────────────────────────────────────────────────────────
+   오류 처리 매크로
+   ───────────────────────────────────────────────────────── */
+#define GPU_CHECK(call)                                                \
+    do {                                                               \
+        hipError_t _e = (call);                                        \
+        if (_e != hipSuccess) {                                        \
+            fprintf(stderr, "\n[GPU ERR] %s:%d  %s\n",                 \
+                    __FILE__, __LINE__, hipGetErrorString(_e));        \
+            exit(EXIT_FAILURE);                                        \
+        }                                                              \
+    } while (0)
+
+#define GB_BLAS_CHECK(call)                                            \
+    do {                                                               \
+        rocblas_status _s = (call);                                    \
+        if (_s != rocblas_status_success) {                           \
+            fprintf(stderr, "\n[BLAS ERR] %s:%d  code=%d\n",           \
+                    __FILE__, __LINE__, (int)_s);                      \
+            exit(EXIT_FAILURE);                                        \
+        }                                                              \
+    } while (0)
+
+/* ─────────────────────────────────────────────────────────
+   [2] BLAS GEMM (rocBLAS)
+   ─────────────────────────────────────────────────────────
+   rocblas_gemm_ex 는 cublasGemmEx 와 달리:
+     - 출력 D 가 별도 인자 (in-place 로 C=D, ldc=ldd 사용)
+     - compute_type 도 rocblas_datatype 재사용
+     - 끝에 solution_index(0), flags(none) 추가
+   TF32: rocBLAS 에는 cuBLAS 의 COMPUTE_32F_FAST_TF32 같은 단일 호출
+   경로가 없고, XF32 가속은 CDNA(MI200+) 의 xDL 에서만 동작합니다.
+   RDNA3(gfx1100) 등에서는 일반 f32_r 로 폴백합니다 (정확성 유지, TC 미가속).
+   ───────────────────────────────────────────────────────── */
+typedef rocblas_handle gb_blas_handle_t;
+
+static inline int gb_blas_create(gb_blas_handle_t *h, gb_stream_t stream)
+{
+    if (rocblas_create_handle(h) != rocblas_status_success) return -1;
+    rocblas_set_stream(*h, stream);
+    return 0;
+}
+
+static inline void gb_blas_destroy(gb_blas_handle_t h)
+{
+    rocblas_destroy_handle(h);
+}
+
+static inline int gb_gemm(gb_blas_handle_t h, gb_prec_t prec,
+                          int M, int N, int K,
+                          const void *A, const void *B, void *C)
+{
+    const rocblas_operation opN = rocblas_operation_none;
+    const rocblas_gemm_algo algo = rocblas_gemm_algo_standard;
+    const int32_t  sol   = 0;
+    const uint32_t flags = rocblas_gemm_flags_none;
+    rocblas_status st;
+
+    switch (prec) {
+    case GB_PREC_DGEMM: {
+        const double alpha = 1.0, beta = 0.0;
+        st = rocblas_gemm_ex(h, opN, opN, M, N, K, &alpha,
+                A, rocblas_datatype_f64_r, M,
+                B, rocblas_datatype_f64_r, K, &beta,
+                C, rocblas_datatype_f64_r, M,
+                C, rocblas_datatype_f64_r, M,
+                rocblas_datatype_f64_r, algo, sol, flags);
+        break;
+    }
+    case GB_PREC_HGEMM: {
+        /* FP16 in / FP16 acc */
+        const rocblas_half alpha = (rocblas_half){0x3C00};  /* 1.0 in fp16 */
+        const rocblas_half beta  = (rocblas_half){0x0000};  /* 0.0 in fp16 */
+        st = rocblas_gemm_ex(h, opN, opN, M, N, K, &alpha,
+                A, rocblas_datatype_f16_r, M,
+                B, rocblas_datatype_f16_r, K, &beta,
+                C, rocblas_datatype_f16_r, M,
+                C, rocblas_datatype_f16_r, M,
+                rocblas_datatype_f16_r, algo, sol, flags);
+        break;
+    }
+    case GB_PREC_HGEMM_MIX: {
+        /* FP16 in / FP32 acc — alpha,beta 는 compute_type(FP32) 기준 */
+        const float alpha = 1.f, beta = 0.f;
+        st = rocblas_gemm_ex(h, opN, opN, M, N, K, &alpha,
+                A, rocblas_datatype_f16_r, M,
+                B, rocblas_datatype_f16_r, K, &beta,
+                C, rocblas_datatype_f16_r, M,
+                C, rocblas_datatype_f16_r, M,
+                rocblas_datatype_f32_r, algo, sol, flags);
+        break;
+    }
+    case GB_PREC_SGEMM:
+    case GB_PREC_SGEMM_TF32:   /* RDNA3: TF32 가속 경로 없음 → f32 폴백 */
+    default: {
+        const float alpha = 1.f, beta = 0.f;
+        st = rocblas_gemm_ex(h, opN, opN, M, N, K, &alpha,
+                A, rocblas_datatype_f32_r, M,
+                B, rocblas_datatype_f32_r, K, &beta,
+                C, rocblas_datatype_f32_r, M,
+                C, rocblas_datatype_f32_r, M,
+                rocblas_datatype_f32_r, algo, sol, flags);
+        break;
+    }
+    }
+    return (st == rocblas_status_success) ? 0 : -1;
+}
+
+/* ─────────────────────────────────────────────────────────
+   [3] 모니터링 (amd_smi)
+   ─────────────────────────────────────────────────────────
+   NVML 과 달리 amd_smi 는 socket → processor handle 2단계 모델입니다.
+   gb_mon_init() 에서 전체 GPU processor handle 을 평탄화해 배열에 캐시하고,
+   gb_mon_open(dev_id) 은 그 배열의 dev_id 번째를 가져옵니다.
+   (hipGetDeviceProperties 의 device index 순서와 amd_smi 의 enumeration
+    순서가 일반적으로 일치. PCIe BDF 정렬 동일.)
+
+   단위/모델 차이:
+     - 전력: amdsmi_get_power_info().average_socket_power 는 W → ×1000 (mW 통일)
+     - util: amdsmi_get_gpu_activity().gfx_activity (%) — 멀티-GPU 교차오염
+             버그가 없어 NVML 의 GetSamples 우회가 불필요 (직접 현재값)
+     - power cap: amdsmi_get_power_cap_info().power_cap 는 µW(baremetal)
+                  → /1000 (mW 통일)
+     - throttle: gpu_metrics.throttle_status 비트 의미가 NVIDIA와 달라
+                 보수적으로 매핑 (자세한 비트 정의는 추후 정밀화 TODO).
+   ───────────────────────────────────────────────────────── */
+
+#define GB_AMD_MAX_PROC 64
+
+typedef struct {
+    amdsmi_processor_handle handle;
+    int                     valid;
+} gb_mon_t;
+
+/* 전역 processor handle 캐시 (init 시 1회 채움) */
+static amdsmi_processor_handle g_gb_amd_procs[GB_AMD_MAX_PROC];
+static int                     g_gb_amd_proc_count = 0;
+
+static inline int gb_mon_init(void)
+{
+    if (amdsmi_init(AMDSMI_INIT_AMD_GPUS) != AMDSMI_STATUS_SUCCESS)
+        return -1;
+
+    uint32_t sock_count = 0;
+    if (amdsmi_get_socket_handles(&sock_count, NULL) != AMDSMI_STATUS_SUCCESS)
+        return -1;
+    if (sock_count == 0) return -1;
+
+    amdsmi_socket_handle *socks =
+        (amdsmi_socket_handle *)malloc(sock_count * sizeof(*socks));
+    if (!socks) return -1;
+    if (amdsmi_get_socket_handles(&sock_count, socks) != AMDSMI_STATUS_SUCCESS) {
+        free(socks);
+        return -1;
+    }
+
+    g_gb_amd_proc_count = 0;
+    for (uint32_t s = 0; s < sock_count && g_gb_amd_proc_count < GB_AMD_MAX_PROC; s++) {
+        uint32_t pc = 0;
+        if (amdsmi_get_processor_handles(socks[s], &pc, NULL) != AMDSMI_STATUS_SUCCESS)
+            continue;
+        if (pc == 0) continue;
+
+        amdsmi_processor_handle *procs =
+            (amdsmi_processor_handle *)malloc(pc * sizeof(*procs));
+        if (!procs) continue;
+        if (amdsmi_get_processor_handles(socks[s], &pc, procs) == AMDSMI_STATUS_SUCCESS) {
+            for (uint32_t p = 0; p < pc && g_gb_amd_proc_count < GB_AMD_MAX_PROC; p++) {
+                processor_type_t ptype;
+                if (amdsmi_get_processor_type(procs[p], &ptype) == AMDSMI_STATUS_SUCCESS
+                    && ptype == AMDSMI_PROCESSOR_TYPE_AMD_GPU) {
+                    g_gb_amd_procs[g_gb_amd_proc_count++] = procs[p];
+                }
+            }
+        }
+        free(procs);
+    }
+    free(socks);
+    return (g_gb_amd_proc_count > 0) ? 0 : -1;
+}
+
+static inline void gb_mon_shutdown(void) { amdsmi_shut_down(); }
+
+/* HIP device 인덱스 ↔ amd_smi processor handle 매핑.
+   ───────────────────────────────────────────────────────────
+   amd_smi 의 GPU enumeration 순서는 HIP 의 device 인덱스 순서와
+   일치한다는 보장이 없습니다 (서로 다른 라이브러리·정렬 기준).
+   순서가 어긋나면 burn 은 HIP device 0 에서 도는데 모니터링은 다른
+   물리 GPU(idle)를 읽어 전력·클럭·util 이 전부 엉뚱하게 나옵니다.
+   따라서 PCIe BDF(domain:bus:device)로 두 라이브러리의 핸들을
+   정확히 매칭합니다. 매칭 실패 시에만 인덱스 순서로 폴백합니다. */
+static inline int gb_mon_open(int dev_id, gb_mon_t *out)
+{
+    out->valid = 0;
+    if (dev_id < 0 || dev_id >= g_gb_amd_proc_count) return -1;
+
+    /* HIP device 의 PCI 좌표 조회 */
+    hipDeviceProp_t prop;
+    int matched = -1;
+    if (hipGetDeviceProperties(&prop, dev_id) == hipSuccess) {
+        for (int i = 0; i < g_gb_amd_proc_count; i++) {
+            amdsmi_bdf_t bdf;
+            if (amdsmi_get_gpu_device_bdf(g_gb_amd_procs[i], &bdf) != AMDSMI_STATUS_SUCCESS)
+                continue;
+            if ((int)bdf.bus_number    == prop.pciBusID &&
+                (int)bdf.device_number == prop.pciDeviceID &&
+                (int)bdf.domain_number == prop.pciDomainID) {
+                matched = i;
+                break;
+            }
+        }
+    }
+
+    out->handle = (matched >= 0) ? g_gb_amd_procs[matched]
+                                 : g_gb_amd_procs[dev_id];  /* 폴백 */
+    out->valid  = 1;
+    return 0;
+}
+
+static inline unsigned gb_mon_power_mw(gb_mon_t *m)
+{
+    amdsmi_power_info_t info;
+    if (amdsmi_get_power_info(m->handle, &info) != AMDSMI_STATUS_SUCCESS)
+        return 0;
+    /* Navi(RDNA) 계열은 average_socket_power(W) 사용. 일부 칩은 0 이면
+       current_socket_power 로 폴백. mW 로 통일. */
+    unsigned w = info.average_socket_power;
+    if (w == 0 || w == 0xFFFF) w = info.current_socket_power;
+    return w * 1000u;
+}
+
+static inline unsigned gb_mon_tdp_mw(gb_mon_t *m)
+{
+    amdsmi_power_cap_info_t cap;
+    if (amdsmi_get_power_cap_info(m->handle, 0, &cap) != AMDSMI_STATUS_SUCCESS)
+        return 0;
+    /* baremetal: µW 단위 → mW 로 변환 */
+    return (unsigned)(cap.power_cap / 1000ull);
+}
+
+static inline int gb_mon_temp_c(gb_mon_t *m)
+{
+    int64_t t = 0;
+    /* hotspot(junction) 우선, 실패 시 edge */
+    if (amdsmi_get_temp_metric(m->handle, AMDSMI_TEMPERATURE_TYPE_HOTSPOT,
+                               AMDSMI_TEMP_CURRENT, &t) == AMDSMI_STATUS_SUCCESS)
+        return (int)t;
+    if (amdsmi_get_temp_metric(m->handle, AMDSMI_TEMPERATURE_TYPE_EDGE,
+                               AMDSMI_TEMP_CURRENT, &t) == AMDSMI_STATUS_SUCCESS)
+        return (int)t;
+    return -1;
+}
+
+static inline unsigned gb_mon_clock_mhz(gb_mon_t *m)
+{
+    amdsmi_clk_info_t info;
+    if (amdsmi_get_clock_info(m->handle, AMDSMI_CLK_TYPE_GFX, &info)
+        != AMDSMI_STATUS_SUCCESS)
+        return 0;
+    return info.clk;   /* MHz */
+}
+
+/* amd_smi 는 GPU handle 별 즉시 현재값을 반환하므로 NVML 같은
+   멀티-GPU 교차오염이 없습니다. 링버퍼/타임스탬프 추적 불필요. */
+static inline double gb_mon_util_pct(gb_mon_t *m)
+{
+    amdsmi_engine_usage_t use;
+    if (amdsmi_get_gpu_activity(m->handle, &use) != AMDSMI_STATUS_SUCCESS)
+        return -1.0;
+    return (double)use.gfx_activity;
+}
+
+static inline unsigned gb_mon_throttle(gb_mon_t *m)
+{
+    amdsmi_gpu_metrics_t gm;
+    if (amdsmi_get_gpu_metrics_info(m->handle, &gm) != AMDSMI_STATUS_SUCCESS)
+        return GB_THROTTLE_NONE;
+    /* throttle_status != 0 이면 어떤 형태든 throttling 중.
+       AMD 의 indep_throttle_status 비트 정의는 ASIC 별로 달라
+       thermal/power 세분류는 보수적으로 둡니다 (TODO: gfx1100 비트맵 정밀화).
+       현재는 0이 아니면 POWER_BRAKE 로 표시 (대다수 burn 상황은 전력 한계). */
+    if (gm.throttle_status != 0)
+        return GB_THROTTLE_POWER_BRAKE;
+    return GB_THROTTLE_NONE;
+}
+
+#endif /* BACKEND_AMD_H */

@@ -39,10 +39,12 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <time.h>
-#include <cuda_runtime.h>
-#include <cublas_v2.h>
-#include <cuda_fp16.h>
-#include <nvml.h>
+
+/* 벤더 추상화 레이어. 빌드 시 -DGB_BACKEND_NVIDIA 또는 -DGB_BACKEND_AMD 로
+   백엔드를 선택하면, 이 헤더가 CUDA/cuBLAS/NVML 또는 HIP/rocBLAS/amd_smi
+   구현(타입·함수·매크로)을 주입합니다. 본체는 벤더 SDK 헤더를 직접
+   포함하지 않습니다. (GPU 커널의 __half 등 fp16 타입도 backend 헤더가 제공) */
+#include "gpu_backend.h"
 
 /* ─────────────────────────────────────────────────────────
    Burn-pressure compare kernels (-x 모드 전용)
@@ -141,51 +143,26 @@ extern "C" __global__ void init_random_f16(__half *buf, size_t n, unsigned seed)
 
 /* ─────────────────────────────────────────────────────────
    오류 처리 매크로
-   ───────────────────────────────────────────────────────── */
+   ─────────────────────────────────────────────────────────
+   GPU runtime / BLAS 검사 매크로는 추상화 레이어(backend_*.h)가
+   GPU_CHECK / GB_BLAS_CHECK 로 제공합니다. 본체는 기존 이름
+   CUDA_CHECK / CUBLAS_CHECK 를 그대로 쓰기 위해 별칭만 둡니다.
+   (모니터링은 gb_mon_* 로 추상화되어 NVML_CHECK 는 더 이상 불필요) */
 
-#define CUDA_CHECK(call)                                               \
-    do {                                                               \
-        cudaError_t _e = (call);                                       \
-        if (_e != cudaSuccess) {                                       \
-            fprintf(stderr, "\n[CUDA ERR] %s:%d  %s\n",               \
-                    __FILE__, __LINE__, cudaGetErrorString(_e));       \
-            exit(EXIT_FAILURE);                                        \
-        }                                                              \
-    } while (0)
-
-#define CUBLAS_CHECK(call)                                             \
-    do {                                                               \
-        cublasStatus_t _s = (call);                                    \
-        if (_s != CUBLAS_STATUS_SUCCESS) {                             \
-            fprintf(stderr, "\n[cuBLAS ERR] %s:%d  code=%d\n",        \
-                    __FILE__, __LINE__, (int)_s);                      \
-            exit(EXIT_FAILURE);                                        \
-        }                                                              \
-    } while (0)
-
-#define NVML_CHECK(call)                                               \
-    do {                                                               \
-        nvmlReturn_t _r = (call);                                      \
-        if (_r != NVML_SUCCESS)                                        \
-            fprintf(stderr, "[NVML WARN] %s\n", nvmlErrorString(_r)); \
-    } while (0)
+#define CUDA_CHECK(call)    GPU_CHECK(call)
+#define CUBLAS_CHECK(call)  GB_BLAS_CHECK(call)
 
 /* ─────────────────────────────────────────────────────────
    GPU 코어 수 테이블 (동적 Rpeak 계산용)
    ─────────────────────────────────────────────────────────
-   출처: NVIDIA 공식 아키텍처 화이트페이퍼 / datasheet
-   cores_fp32   : CUDA FP32 코어 수
-   cores_fp64   : CUDA FP64 코어 수 (0 = 미지원)
-                  소비자급 Ada/Blackwell = FP32 코어의 1/64 (2개/SM)
-                  Hopper = SM당 64개 전용 FP64 코어
-                  L40S   = FP64 코어 없음 → 0
-   cores_tensor : Tensor Core 수
-   tc_ops       : Tensor Core 1개당 클럭당 FP16 ops (acc=FP16 dense 기준)
-                  Blackwell 5th gen: ~1024
-                  Ada 4th gen:        ~512
-                  Hopper 4th gen:    ~2048
+   CoreEntry 구조체만 본체에 두고, 실제 GPU 엔트리는 백엔드별 헤더에서
+   매크로로 주입됩니다:
+     NVIDIA → core_table_nvidia.h (GB_NVIDIA_CORE_ENTRIES)
+     AMD    → core_table_amd.h    (GB_AMD_CORE_ENTRIES)
+   필드 의미와 출처는 각 헤더 주석 참고. AMD 는 Tensor Core 가 없어
+   필드 의미를 재해석합니다 (cores_tensor=CU 수, tc_ops=WMMA ops/CU 등).
 
-   동적 Rpeak 공식:
+   동적 Rpeak 공식 (백엔드 무관):
      FP32  = cores_fp32   × 2 × clock_MHz × 1e-6  [TFLOPS]
      FP64  = cores_fp64   × 2 × clock_MHz × 1e-6  [TFLOPS]
      FP16T = cores_tensor × tc_ops × clock_MHz × 1e-6  [TFLOPS]
@@ -207,75 +184,27 @@ typedef struct {
                                   소비자급: tc_ops의 1/4 (이중 페널티)
                                   Pro급:    tc_ops의 1/2
                                   서버급:   tc_ops의 1/2 */
+    int         fp32_matrix_ops; /* FP32 matrix 가속 ops/cycle (cores_tensor 단위당).
+                                    AMD CDNA 는 Matrix Core 가 FP32 도 가속하므로
+                                    sgemm 이 vector peak 를 초과 가능 → 이 값(>0)이면
+                                    sgemm Rpeak 를 cores_tensor × 이 값 으로 계산.
+                                    NVIDIA 와 RDNA(매트릭스 FP32 미지원)는 0 →
+                                    기존 FP32 vector(cores_fp32 × 2) 기준 유지. */
 } CoreEntry;
 
-/* 구체적인 이름(긴 것)을 먼저 배치해야 substring 매칭이 올바르게 동작 */
+/* GPU 코어 DB. 엔트리는 백엔드별 헤더에서 매크로로 주입됩니다:
+     NVIDIA → core_table_nvidia.h 의 GB_NVIDIA_CORE_ENTRIES
+     AMD    → core_table_amd.h    의 GB_AMD_CORE_ENTRIES
+   (각 헤더는 백엔드 헤더 backend_*.h 가 include). 두 테이블은 서로 다른
+   백엔드 빌드에서만 컴파일되므로 GPU 이름 충돌이 없고, 한 빌드에 한 벤더의
+   엔트리만 들어갑니다. 구체적인(긴) 이름을 먼저 배치해야 substring 매칭이
+   올바르게 동작합니다. */
 static const CoreEntry CORE_TABLE[] = {
-    /* Blackwell RTX PRO — GB202 full (188 SM)
-       FP32=128/SM×188=24064, FP64=2/SM=376
-       whitepaper 명시대로 FP32 누산 페널티 없음 → tc_ops_mix = tc_ops = 256
-       TF32 dense = tc_ops/2 = 128 (Pro 풀스피드)                          */
-    { "RTX PRO 6000 Blackwell Server Edition", 24064, 376, 752,  256,  256, 128 },
-    { "RTX PRO 6000 Blackwell Max-Q",          24064, 376, 752,  256,  256, 128 },
-    { "RTX PRO 6000 Blackwell",                24064, 376, 752,  256,  256, 128 },
-    /* Blackwell GeForce — GB202 (170 SM), GB203 (84 SM)
-       FP64=2/SM (소비자급). HW 강제 반속 → tc_ops_mix = tc_ops/2 = 128
-       TF32 dense = tc_ops/4 = 64 (이중 페널티)                            */
-    { "GeForce RTX 5090",                      21760, 340, 680,  256,  128,  64 },
-    { "GeForce RTX 5080",                      10752, 168, 336,  256,  128,  64 },
-    /* Ada GeForce — AD102 (128 SM), AD103 (76 SM)
-       FP64=2/SM (소비자급). HW 강제 반속, TF32 이중 페널티                */
-    { "GeForce RTX 4090",                      16384, 256, 512,  256,  128,  64 },
-    { "GeForce RTX 4080",                       9728, 152, 304,  256,  128,  64 },
-    /* Ada Professional / Data Center — AD102 full (142 SM)
-       whitepaper 명시대로 풀스피드, TF32 = tc_ops/2 = 128                 */
-    { "RTX 6000 Ada",                          18176, 284, 568,  256,  256, 128 },
-    { "L40S",                                  18176, 284, 568,  256,  256, 128 },
-    /* Hopper — GH100 (132 SM for H200 NVL)
-       FP64=64/SM=8448 (전용 코어). FP16 dense = 989 TFLOPS @ 1830 MHz
-       TF32 dense = 494 TFLOPS = tc_ops/2 = 512                            */
-    { "H200 NVL",                              16896, 8448, 528, 1024, 1024,  512 },
-    { "H200",                                  16896, 8448, 528, 1024, 1024,  512 },
-    /* Blackwell DC — B200 (160 SM × 2-die fused, FP32=128/SM=20480)
-       FP64=64/SM=10240. FP16 dense = 2250 TFLOPS @ ~1717 MHz
-       NVIDIA가 세대마다 tc_ops 2배: A100=512 → H200=1024 → B200=2048
-       TF32 dense = 1125 TFLOPS = tc_ops/2 = 1024                          */
-    { "B200",                                  20480, 10240, 640, 2048, 2048, 1024 },
-    /* Ampere DC — GA100, FP32 누산 페널티 없음
-       FP16 dense = 312 TFLOPS, TF32 dense = 156 TFLOPS @ 1410 MHz → 256   */
-    { "A100",                                   6912, 3456, 432,  512,  512,  256 },
-    /* Ampere Pro — RTX A-series, GA102/GA104. Pro 풀스피드 (FP32 acc 페널티 없음).
-       FP64=2/SM (1/64 of FP32, 소비자급 비율). ops: 256/256/128             */
-    { "RTX A6000",                             10752,  168, 336,  256,  256,  128 },
-    { "RTX A5000",                              8192,  128, 256,  256,  256,  128 },
-    { "RTX A4000",                              6144,   96, 192,  256,  256,  128 },
-    /* Ampere GeForce — GA102 (84 SM), GA104 (48 SM), GA106 (28 SM)
-       FP64=2/SM (소비자급). 소비자 페널티 적용: ops 256/128/64
-       Ti 변형은 더 구체적이므로 일반 변형보다 먼저 배치 (substring matching) */
-    { "GeForce RTX 3090 Ti",                   10752,  168, 336,  256,  128,   64 },
-    { "GeForce RTX 3090",                      10496,  164, 328,  256,  128,   64 },
-    { "GeForce RTX 3080 Ti",                   10240,  160, 320,  256,  128,   64 },
-    { "GeForce RTX 3080",                       8704,  136, 272,  256,  128,   64 },
-    { "GeForce RTX 3070 Ti",                    6144,   96, 192,  256,  128,   64 },
-    { "GeForce RTX 3070",                       5888,   92, 184,  256,  128,   64 },
-    { "GeForce RTX 3060 Ti",                    4864,   76, 152,  256,  128,   64 },
-    { "GeForce RTX 3060",                       3584,   56, 112,  256,  128,   64 },
-    { "GeForce RTX 3050",                       2560,   40,  80,  256,  128,   64 },
-    /* Turing Pro (Quadro RTX) — TU102 full / TU104
-       2nd gen TC, TF32 미지원 (tc_ops_tf32 = 0).
-       RTX 8000/6000은 compute 동일 (VRAM만 다름)                            */
-    { "Quadro RTX 8000",                        4608,  144, 576,  128,  128,    0 },
-    { "Quadro RTX 6000",                        4608,  144, 576,  128,  128,    0 },
-    { "Quadro RTX 5000",                        3072,   96, 384,  128,  128,    0 },
-    /* Turing GeForce/Titan — TU102 cut (68 SM) / TU102 full (72 SM) / TU104 (46 SM)
-       2nd gen TC, TF32 미지원. FP32 acc 페널티 없음 (소비자 페널티는 Ampere부터). */
-    { "GeForce RTX 2080 Ti",                    4352,  136, 544,  128,  128,    0 },
-    { "Titan RTX",                              4608,  144, 576,  128,  128,    0 },
-    { "GeForce RTX 2080",                       2944,   92, 368,  128,  128,    0 },
-    /* Volta DC — GV100 (80 SM), 1st gen TC, FP16 input only, TF32 미지원.
-       FP64=32/SM=2560 (1:2 of FP32, DC 풀 FP64). "Tesla V100"이 "V100"보다 먼저. */
-    { "Tesla V100",                             5120, 2560, 640,  128,  128,    0 },
-    { "V100",                                   5120, 2560, 640,  128,  128,    0 },
+#if defined(GB_BACKEND_NVIDIA)
+    GB_NVIDIA_CORE_ENTRIES
+#elif defined(GB_BACKEND_AMD)
+    GB_AMD_CORE_ENTRIES
+#endif
     /* sentinel */
     { NULL, 0, 0, 0, 0, 0, 0 }
 };
@@ -328,13 +257,14 @@ static inline double now_sec(void)
    타입 정의
    ───────────────────────────────────────────────────────── */
 
-typedef enum {
-    PREC_SGEMM,
-    PREC_DGEMM,
-    PREC_HGEMM,
-    PREC_HGEMM_MIX,
-    PREC_SGEMM_TF32   /* FP32 storage + TF32 Tensor Core compute */
-} PrecType;
+/* 정밀도 타입은 추상화 레이어의 gb_prec_t 를 그대로 사용합니다.
+   본체 코드 호환을 위해 기존 이름(PrecType / PREC_*)을 별칭으로 둡니다. */
+typedef gb_prec_t PrecType;
+#define PREC_SGEMM       GB_PREC_SGEMM
+#define PREC_DGEMM       GB_PREC_DGEMM
+#define PREC_HGEMM       GB_PREC_HGEMM
+#define PREC_HGEMM_MIX   GB_PREC_HGEMM_MIX
+#define PREC_SGEMM_TF32  GB_PREC_SGEMM_TF32
 
 /* random init dispatch helper (PrecType 정의 후) */
 static void init_buffer_random(void *buf, size_t n_elem, PrecType prec,
@@ -382,16 +312,17 @@ typedef struct {
 } Config;
 
 /* 기본 행렬 크기 (M=N=K).
-   32768은 큰 GPU(RTX 5090, PRO 6000 SE, H200 등)에서 메모리 트래픽과 SM 점유율
-   모두 충분히 확보되어 max TDP 도달이 가장 안정적. -X 옵션으로 override 가능
-   (예: -X 16384, -X 8192). */
-#define DEFAULT_MAT_SIZE 32768
+   16384는 대부분의 GPU에서 메모리 트래픽과 SM 점유율을 충분히 확보하면서도
+   초기화 시간과 VRAM 부담이 과하지 않은 균형점. 매우 큰 GPU(RTX 5090,
+   PRO 6000 SE, H200 등)에서 더 강한 부하가 필요하면 -X 32768 로 키울 수 있고,
+   작은 GPU나 gpu-burn 모사에는 -X 8192 를 사용. */
+#define DEFAULT_MAT_SIZE 16384
 
 /* 단일 GEMM 스트림 워커 */
 typedef struct {
-    int            device_id;
-    cublasHandle_t handle;
-    cudaStream_t   stream;
+    int              device_id;
+    gb_blas_handle_t handle;       /* cuBLAS / rocBLAS 핸들 (추상화) */
+    cudaStream_t     stream;
     cudaEvent_t    ev_start, ev_stop;
     void          *dA, *dB;
     void          *dC_ring;       /* 단일 연속 할당, num_c × c_bytes */
@@ -411,8 +342,8 @@ typedef struct {
     int         mat_size;
     size_t      vram_used_mb;
 
-    /* NVML */
-    nvmlDevice_t nvml_dev;
+    /* 모니터링 핸들 (NVML / amd_smi 추상화) */
+    gb_mon_t     mon;
     unsigned int tdp_mw;
 
     /* 코어 정보 (동적 Rpeak 계산용) */
@@ -443,7 +374,7 @@ typedef struct {
     volatile unsigned int cur_temp;
     volatile unsigned int cur_util;
     volatile unsigned int cur_clock;
-    volatile unsigned long long cur_throttle_reasons;  /* NVML throttle bitmask */
+    volatile unsigned int cur_throttle;  /* GB_THROTTLE_* 비트마스크 (벤더 중립) */
 
     /* 벤치 스레드 */
     GemmWorker  *workers;
@@ -512,12 +443,14 @@ static void worker_init(GemmWorker *w, int device_id,
     w->cur_c_idx = 0;
 
     CUDA_CHECK(cudaStreamCreate(&w->stream));
-    CUBLAS_CHECK(cublasCreate(&w->handle));
-    CUBLAS_CHECK(cublasSetStream(w->handle, w->stream));
 
-    /* Modern API: cublasGemmEx에 compute type을 명시적으로 지정하므로
-       handle의 math mode는 cublasGemmEx에 무영향. DEFAULT로 고정. */
-    CUBLAS_CHECK(cublasSetMathMode(w->handle, CUBLAS_DEFAULT_MATH));
+    /* BLAS 핸들 생성 + 스트림 바인딩 (+ NVIDIA는 math mode DEFAULT 고정).
+       Modern API(cublasGemmEx/rocblas_gemm_ex)가 compute type을 명시
+       지정하므로 핸들 math mode 는 무영향. 세부는 backend gb_blas_create. */
+    if (gb_blas_create(&w->handle, w->stream) != 0) {
+        fprintf(stderr, "\n[BLAS ERR] %s:%d  handle 생성 실패\n", __FILE__, __LINE__);
+        exit(EXIT_FAILURE);
+    }
 
     CUDA_CHECK(cudaEventCreate(&w->ev_start));
     CUDA_CHECK(cudaEventCreate(&w->ev_stop));
@@ -577,7 +510,7 @@ static void worker_free(GemmWorker *w)
     cudaFree(w->dC_ring);
     cudaEventDestroy(w->ev_start);
     cudaEventDestroy(w->ev_stop);
-    cublasDestroy(w->handle);
+    gb_blas_destroy(w->handle);
     cudaStreamDestroy(w->stream);
 }
 
@@ -607,79 +540,16 @@ static void run_gemm(GemmWorker *w)
     const int M = w->M, N = w->N, K = w->K;
     void *dC = current_c_ptr(w);
 
-    /* 모든 GEMM을 cublasGemmEx로 통일 (modern API).
-       compute type 및 data type을 명시적으로 지정 → cuBLAS heuristic이
-       deprecated cublasSetMathMode에 의존하지 않음. */
-    switch (w->prec) {
-    case PREC_SGEMM: {
-        const float alpha = 1.f, beta = 0.f;
-        CUBLAS_CHECK(cublasGemmEx(
-            w->handle, CUBLAS_OP_N, CUBLAS_OP_N,
-            M, N, K,
-            &alpha, w->dA, CUDA_R_32F, M,
-                    w->dB, CUDA_R_32F, K,
-            &beta,  dC, CUDA_R_32F, M,
-            CUBLAS_COMPUTE_32F,        /* 순수 FP32, TC 미사용 */
-            CUBLAS_GEMM_DEFAULT));
-        break;
-    }
-    case PREC_DGEMM: {
-        const double alpha = 1.0, beta = 0.0;
-        CUBLAS_CHECK(cublasGemmEx(
-            w->handle, CUBLAS_OP_N, CUBLAS_OP_N,
-            M, N, K,
-            &alpha, w->dA, CUDA_R_64F, M,
-                    w->dB, CUDA_R_64F, K,
-            &beta,  dC, CUDA_R_64F, M,
-            CUBLAS_COMPUTE_64F,        /* FP64 */
-            CUBLAS_GEMM_DEFAULT));
-        break;
-    }
-    case PREC_HGEMM: {
-        const __half alpha = __float2half(1.f);
-        const __half beta  = __float2half(0.f);
-        CUBLAS_CHECK(cublasGemmEx(
-            w->handle, CUBLAS_OP_N, CUBLAS_OP_N,
-            M, N, K,
-            &alpha, w->dA, CUDA_R_16F, M,
-                    w->dB, CUDA_R_16F, K,
-            &beta,  dC, CUDA_R_16F, M,
-            CUBLAS_COMPUTE_16F,        /* FP16 in/acc, Tensor Core */
-            CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-        break;
-    }
-    case PREC_HGEMM_MIX: {
-        /* FP16 입력/출력 storage + FP32 누산 (mixed precision)
-           이론 TFLOPS는 PREC_HGEMM의 1/2 (소비자/Pro급) 또는 동일 (서버급)이지만
-           실측 TDP가 가장 높아 burn-in 기본 정밀도로 사용됩니다. */
-        const float alpha = 1.f, beta = 0.f;
-        CUBLAS_CHECK(cublasGemmEx(
-            w->handle, CUBLAS_OP_N, CUBLAS_OP_N,
-            M, N, K,
-            &alpha, w->dA, CUDA_R_16F, M,
-                    w->dB, CUDA_R_16F, K,
-            &beta,  dC, CUDA_R_16F, M,
-            CUBLAS_COMPUTE_32F,        /* FP16 in, FP32 acc — TC mixed precision */
-            CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-        break;
-    }
-    case PREC_SGEMM_TF32: {
-        /* FP32 storage + TF32 Tensor Core compute.
-           CUBLAS_COMPUTE_32F_FAST_TF32 → 입력 FP32 mantissa를 TF32(19-bit)로
-           자르고 TC MMA로 가속, 누산은 FP32. Ampere(sm_80) 이상 필요.
-           burn 모드의 TDP 효과는 cuBLAS call 자체가 아니라 multi-C ring +
-           compare 커널 + random init에서 나옴 (call API는 통일). */
-        const float alpha = 1.f, beta = 0.f;
-        CUBLAS_CHECK(cublasGemmEx(
-            w->handle, CUBLAS_OP_N, CUBLAS_OP_N,
-            M, N, K,
-            &alpha, w->dA, CUDA_R_32F, M,
-                    w->dB, CUDA_R_32F, K,
-            &beta,  dC, CUDA_R_32F, M,
-            CUBLAS_COMPUTE_32F_FAST_TF32,
-            CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-        break;
-    }
+    /* GEMM 실행은 추상화 레이어 gb_gemm() 로 통일.
+       op=N/N, alpha=1, beta=0, lda=M ldb=K ldc=M 고정.
+       정밀도별 data/compute type 매핑은 backend 가 담당:
+         NVIDIA → cublasGemmEx (COMPUTE_32F / 64F / 16F / 32F_FAST_TF32 ...)
+         AMD    → rocblas_gemm_ex (f32_r / f64_r / f16_r, TF32는 f32 폴백)
+       TF32 가속 효과나 multi-C ring 메모리 부하는 호출 의미와 무관하게
+       유지됩니다 (call API만 추상화, 부하 패턴은 본체 로직 그대로). */
+    if (gb_gemm(w->handle, w->prec, M, N, K, w->dA, w->dB, dC) != 0) {
+        fprintf(stderr, "\n[BLAS ERR] %s:%d  gb_gemm 실패\n", __FILE__, __LINE__);
+        exit(EXIT_FAILURE);
     }
 
     /* ring 슬롯 advance */
@@ -687,76 +557,41 @@ static void run_gemm(GemmWorker *w)
 }
 
 /* ─────────────────────────────────────────────────────────
-   NVML Util 샘플링
-   ─────────────────────────────────────────────────────────
-   nvmlDeviceGetUtilizationRates()는 드라이버 공유 버퍼를 사용해
-   멀티-GPU 환경에서 서로 다른 GPU임에도 같은 값이 반환되는 버그가
-   있습니다. nvmlDeviceGetSamples()는 GPU handle 별 독립 링버퍼를
-   유지하므로 각 GPU의 Util을 정확히 측정할 수 있습니다.
-   ───────────────────────────────────────────────────────── */
-
-static double read_util_samples(nvmlDevice_t dev, unsigned long long *last_ts)
-{
-    unsigned int count = 0;
-    nvmlValueType_t vtype;
-
-    nvmlReturn_t r = nvmlDeviceGetSamples(
-        dev, NVML_GPU_UTILIZATION_SAMPLES, *last_ts, &vtype, &count, NULL);
-    if (r != NVML_SUCCESS || count == 0)
-        return -1.0;
-
-    nvmlSample_t *buf = (nvmlSample_t *)malloc(count * sizeof(nvmlSample_t));
-    if (!buf) return -1.0;
-
-    r = nvmlDeviceGetSamples(
-        dev, NVML_GPU_UTILIZATION_SAMPLES, *last_ts, &vtype, &count, buf);
-
-    double sum = 0.0;
-    unsigned int valid = 0;
-    if (r == NVML_SUCCESS) {
-        for (unsigned int i = 0; i < count; i++) {
-            sum += buf[i].sampleValue.uiVal;
-            if (buf[i].timeStamp > *last_ts)
-                *last_ts = buf[i].timeStamp;
-            valid++;
-        }
-    }
-    free(buf);
-    return (valid > 0) ? sum / valid : -1.0;
-}
-
-/* ─────────────────────────────────────────────────────────
    모니터링 스레드 (GPU 당 1개, 100ms 폴링)
+   ─────────────────────────────────────────────────────────
+   측정값은 추상화 레이어 gb_mon_* 로 읽습니다. 백엔드 차이:
+     - NVIDIA: 전력 mW, util 은 GPU별 독립 링버퍼(GetSamples)로 멀티-GPU
+               교차오염 우회. throttle 은 NVML reason 비트.
+     - AMD:    전력 W→mW 변환, util 은 amd_smi 가 핸들별 즉시 현재값을
+               주므로 교차오염 없음. throttle 은 gpu_metrics 상태.
+   본체는 mW 를 받아 W 로 변환하고, throttle 은 GB_THROTTLE_* 비트로 받습니다.
    ───────────────────────────────────────────────────────── */
 
 static void *monitor_thread(void *arg)
 {
     GpuCtx *g = (GpuCtx *)arg;
-    unsigned long long util_last_ts = 0;
 
     /* 첫 루프 전에 cur_* 필드를 초기화해 race condition 방지 */
     {
-        unsigned int tmp = 0;
-        double u = read_util_samples(g->nvml_dev, &util_last_ts);
+        double u = gb_mon_util_pct(&g->mon);
         g->cur_util  = (u >= 0.0) ? (unsigned int)u : 0;
-        if (nvmlDeviceGetTemperature(g->nvml_dev, NVML_TEMPERATURE_GPU, &tmp) == NVML_SUCCESS)
-            g->cur_temp = tmp;
-        if (nvmlDeviceGetClockInfo(g->nvml_dev, NVML_CLOCK_SM, &tmp) == NVML_SUCCESS)
-            g->cur_clock = tmp;
+        int t = gb_mon_temp_c(&g->mon);
+        if (t >= 0) g->cur_temp = (unsigned int)t;
+        unsigned int c = gb_mon_clock_mhz(&g->mon);
+        if (c > 0) g->cur_clock = c;
     }
 
     while (g->mon_running) {
-        unsigned int pw = 0, temp = 0, clk = 0;
-
-        /* 전력 */
+        /* 전력 (mW → W) */
         double pw_w = 0.0;
-        if (nvmlDeviceGetPowerUsage(g->nvml_dev, &pw) == NVML_SUCCESS) {
-            pw_w = pw / 1000.0;
+        unsigned int pw_mw = gb_mon_power_mw(&g->mon);
+        if (pw_mw > 0) {
+            pw_w = pw_mw / 1000.0;
             g->sum_power += pw_w;
         }
 
         /* Util */
-        double u = read_util_samples(g->nvml_dev, &util_last_ts);
+        double u = gb_mon_util_pct(&g->mon);
         if (u >= 0.0) {
             g->sum_util += u;
             g->cur_util  = (unsigned int)u;
@@ -764,31 +599,30 @@ static void *monitor_thread(void *arg)
         }
 
         /* 온도 */
-        if (nvmlDeviceGetTemperature(g->nvml_dev, NVML_TEMPERATURE_GPU, &temp) == NVML_SUCCESS) {
+        int temp = gb_mon_temp_c(&g->mon);
+        if (temp >= 0) {
             g->sum_temp += (double)temp;
-            g->cur_temp  = temp;
+            g->cur_temp  = (unsigned int)temp;
         }
 
-        /* SM Clock */
+        /* SM/GFX Clock */
         double clk_d = 0.0;
-        if (nvmlDeviceGetClockInfo(g->nvml_dev, NVML_CLOCK_SM, &clk) == NVML_SUCCESS) {
+        unsigned int clk = gb_mon_clock_mhz(&g->mon);
+        if (clk > 0) {
             clk_d = (double)clk;
             g->sum_clock += clk_d;
             g->cur_clock  = clk;
         }
 
-        /* Throttle reasons (CUDA 12.5+ 에서 EventReasons로 rename, 구버전 함수도 유효).
-           SW Power Cap은 burn 모드에서 의도된 동작이라 별도 추적 안 함.
-           HW Slowdown 우산 flag도 thermal/power brake 둘 중 하나가 같이 set되면 자동 카운트됨. */
-        unsigned long long reasons = 0;
-        if (nvmlDeviceGetCurrentClocksThrottleReasons(g->nvml_dev, &reasons) == NVML_SUCCESS) {
-            g->cur_throttle_reasons = reasons;
-            if (reasons & (nvmlClocksThrottleReasonSwThermalSlowdown
-                         | nvmlClocksThrottleReasonHwThermalSlowdown))
-                g->throttle_thermal_samples++;
-            if (reasons & nvmlClocksThrottleReasonHwPowerBrakeSlowdown)
-                g->throttle_powerbrake_samples++;
-        }
+        /* Throttle (벤더 중립 GB_THROTTLE_* 비트마스크).
+           SW Power Cap 등 의도된 상태는 backend 에서 제외하고 thermal /
+           power brake 만 보고합니다. */
+        unsigned int reasons = gb_mon_throttle(&g->mon);
+        g->cur_throttle = reasons;
+        if (reasons & GB_THROTTLE_THERMAL)
+            g->throttle_thermal_samples++;
+        if (reasons & GB_THROTTLE_POWER_BRAKE)
+            g->throttle_powerbrake_samples++;
 
         g->mon_samples++;
 
@@ -949,6 +783,13 @@ static double calc_dynamic_rpeak(const GpuCtx *gc, PrecType prec, double clock_m
                    * (double)gc->core_info.tc_ops_tf32 * clock_mhz * 1e-6;
         case PREC_SGEMM:
         default:
+            /* AMD CDNA 는 Matrix Core 가 FP32 도 가속하므로, BLAS(rocBLAS)가
+               sgemm 을 FP32 matrix 로 올려 vector peak 를 초과할 수 있습니다.
+               fp32_matrix_ops > 0 이면 matrix 기준 Rpeak 를 사용 (cores_tensor
+               단위당 ops). NVIDIA/RDNA 는 0 이라 기존 FP32 vector 기준 유지. */
+            if (gc->core_info.fp32_matrix_ops > 0)
+                return gc->core_info.cores_tensor
+                       * (double)gc->core_info.fp32_matrix_ops * clock_mhz * 1e-6;
             return gc->core_info.cores_fp32 * 2.0 * clock_mhz * 1e-6;
     }
 }
@@ -1044,15 +885,15 @@ static void print_progress(int elapsed, int total,
         const char *tc = temp_color((double)gc->cur_temp);
 
         /* Throttle 표시 (5열): THERM (열) > PWR (전력 brake) > "  -  " (없음)
-           우선순위는 thermal > power brake. SW Power Cap은 의도된 상태라 표시 안 함. */
+           우선순위는 thermal > power brake. SW Power Cap은 의도된 상태라 표시 안 함.
+           벤더 중립 GB_THROTTLE_* 비트 기준 (backend 가 native → 공용 매핑). */
         const char *throt_str;
         const char *throt_color;
-        unsigned long long r = gc->cur_throttle_reasons;
-        if (r & (nvmlClocksThrottleReasonSwThermalSlowdown
-               | nvmlClocksThrottleReasonHwThermalSlowdown)) {
+        unsigned int r = gc->cur_throttle;
+        if (r & GB_THROTTLE_THERMAL) {
             throt_str   = "THERM";
             throt_color = CLR_RED;
-        } else if (r & nvmlClocksThrottleReasonHwPowerBrakeSlowdown) {
+        } else if (r & GB_THROTTLE_POWER_BRAKE) {
             throt_str   = "  PWR";
             throt_color = CLR_YELLOW;
         } else {
@@ -1125,11 +966,19 @@ static void print_usage(const char *prog)
     printf("\n사용법: %s [옵션]\n\n", prog);
     printf("  -t <초>      총 측정 시간                          (기본: 3600)\n");
     printf("  -i <강도>    GPU 당 동시 GEMM 스트림 수            (기본: 1)\n");
-    printf("  -p <타입>    sgemm | dgemm | hgemm | hgemm_mix | sgemm_tf32   (기본: sgemm_tf32)\n");
+    printf("  -p <타입>    sgemm | dgemm | hgemm | hgemm_mix | sgemm_tf32   (기본: %s)\n",
+           GB_DEFAULT_PREC_NAME);
     printf("               sgemm      → FP32 (cublasGemmEx, COMPUTE_32F)\n");
     printf("               dgemm      → FP64 (cublasGemmEx, COMPUTE_64F)\n");
     printf("               hgemm      → FP16 in / FP16 acc Tensor Core\n");
     printf("                            이론 피크 TFLOPS가 가장 높음\n");
+#if defined(GB_BACKEND_AMD)
+    printf("               hgemm_mix  → FP16 in / FP32 acc Matrix Core (mixed precision) [기본]\n");
+    printf("                            AMD Matrix Core(WMMA/MFMA)의 네이티브 고속 경로,\n");
+    printf("                            실측 TFLOPS·TDP 최대. (hgemm은 CDNA에서 저속 폴백)\n");
+    printf("               sgemm_tf32 → FP32 storage + TF32 compute (RDNA3는 FP32 폴백)\n");
+    printf("                            메모리 대역폭 부하 + compute 부하 동시 발생.\n");
+#else
     printf("               hgemm_mix  → FP16 in / FP32 acc Tensor Core (mixed precision)\n");
     printf("                            소비자급은 hgemm의 1/2 처리량,\n");
     printf("                            Pro/서버급(A100/H100/H200)은 hgemm과 동일.\n");
@@ -1137,14 +986,15 @@ static void print_usage(const char *prog)
     printf("                            CUBLAS_COMPUTE_32F_FAST_TF32, Ampere+ 필요.\n");
     printf("                            메모리 대역폭 부하 + TC 부하 동시 발생,\n");
     printf("                            gpu-burn -tc 와 동일 의도.\n");
+#endif
     printf("  -m <값>      메모리 사용량\n");
     printf("                 숫자   : M=N=K 행렬 크기            (예: -m 8192)\n");
     printf("                 숫자%%  : VRAM 대비 비율             (예: -m 80%%)\n");
     printf("               (기본: -m 100%%)\n");
     printf("  -g <목록>    사용할 GPU ID (쉼표 구분)             (기본: 전체)\n");
     printf("  -X <크기>    행렬 크기 M override (기본 %d)\n", DEFAULT_MAT_SIZE);
-    printf("               권장값: 8192 (gpu-burn 정확 모사)\n");
-    printf("                       16384, 32768 (큰 GPU에서 더 강한 메모리 부하)\n");
+    printf("               권장값: 8192 (gpu-burn 정확 모사),\n");
+    printf("                       16384 (기본, 균형), 32768 (큰 GPU 최대 부하)\n");
     printf("               우선순위: -X > -m 절대크기 > 기본 %d\n", DEFAULT_MAT_SIZE);
     printf("  -I <모드>    A,B 데이터 초기화 방식: memset | rand   (기본: rand)\n");
     printf("                 memset: cudaMemset(1) — denormal FP32 (TC switching 최소)\n");
@@ -1153,7 +1003,8 @@ static void print_usage(const char *prog)
     printf("  -l           GPU 목록 출력 후 종료\n");
     printf("  -h           도움말\n\n");
     printf("예시:\n");
-    printf("  %s                           # 기본: sgemm_tf32 + rand, M=%d ring\n", prog, DEFAULT_MAT_SIZE);
+    printf("  %s                           # 기본: %s + rand, M=%d ring\n",
+           prog, GB_DEFAULT_PREC_NAME, DEFAULT_MAT_SIZE);
     printf("  %s -p hgemm_mix              # FP16 in / FP32 acc Tensor Core 측정\n", prog);
     printf("  %s -p hgemm                  # FP16 in / FP16 acc TC (이론 피크 TFLOPS 최대)\n", prog);
     printf("  %s -p sgemm                  # FP32 SGEMM (TC 미사용)\n", prog);
@@ -1167,7 +1018,7 @@ static void print_gpu_list(void)
 {
     int n = 0;
     CUDA_CHECK(cudaGetDeviceCount(&n));
-    NVML_CHECK(nvmlInit());
+    gb_mon_init();
 
     printf("\n시스템 GPU 목록 (%d 개)\n", n);
     printf("──────────────────────────────────────────────────────\n");
@@ -1177,10 +1028,10 @@ static void print_gpu_list(void)
     for (int i = 0; i < n; i++) {
         cudaDeviceProp p;
         CUDA_CHECK(cudaGetDeviceProperties(&p, i));
-        nvmlDevice_t dev;
         unsigned int tdp_mw = 0;
-        if (nvmlDeviceGetHandleByIndex(i, &dev) == NVML_SUCCESS)
-            nvmlDeviceGetPowerManagementLimit(dev, &tdp_mw);
+        gb_mon_t mon;
+        if (gb_mon_open(i, &mon) == 0)
+            tdp_mw = gb_mon_tdp_mw(&mon);
         printf("  [%d]  %-28s  %5zu MiB", i, p.name,
                p.totalGlobalMem / (1024 * 1024));
         if (tdp_mw > 0) printf("  %4u W", tdp_mw / 1000);
@@ -1188,7 +1039,7 @@ static void print_gpu_list(void)
     }
 
     printf("──────────────────────────────────────────────────────\n\n");
-    nvmlShutdown();
+    gb_mon_shutdown();
 }
 
 /* ─────────────────────────────────────────────────────────
@@ -1202,7 +1053,7 @@ int main(int argc, char **argv)
     memset(&cfg, 0, sizeof(cfg));
     cfg.duration_sec        = 3600;
     cfg.intensity           = 1;
-    cfg.prec                = PREC_SGEMM_TF32;
+    cfg.prec                = GB_DEFAULT_PREC;  /* 백엔드별 (NVIDIA=sgemm_tf32, AMD=hgemm_mix) */
     cfg.mem_spec.is_percent = 1;
     cfg.mem_spec.value      = 100.0;
     cfg.init_mode           = INIT_RAND;
@@ -1229,7 +1080,7 @@ int main(int argc, char **argv)
             else if (!strcmp(optarg, "hgemm"))      cfg.prec = PREC_HGEMM;
             else if (!strcmp(optarg, "sgemm_tf32")) cfg.prec = PREC_SGEMM_TF32;
             else if (!strcmp(optarg, "sgemm"))      cfg.prec = PREC_SGEMM;
-            else                                    cfg.prec = PREC_SGEMM_TF32;
+            else                                    cfg.prec = GB_DEFAULT_PREC;
             break;
         case 'g':
             cfg.num_gpus = parse_gpu_list(optarg, cfg.gpu_ids, MAX_GPUS);
@@ -1240,8 +1091,13 @@ int main(int argc, char **argv)
         }
     }
 
-    NVML_CHECK(nvmlInit());
-    if (list_only) { print_gpu_list(); nvmlShutdown(); return 0; }
+    /* list_only 는 print_gpu_list 가 자체적으로 모니터링 라이브러리를
+       init/shutdown 하므로 여기서 따로 init 하지 않습니다. */
+    if (list_only) { print_gpu_list(); return 0; }
+
+    if (gb_mon_init() != 0)
+        fprintf(stderr, "[%s WARN] 모니터링 라이브러리 init 실패 — "
+                        "측정값이 0으로 표시될 수 있습니다.\n", GB_MON_NAME);
 
     /* GPU 목록 결정 */
     int sys_gpu_count = 0;
@@ -1321,8 +1177,8 @@ int main(int argc, char **argv)
                                            cfg.prec, cfg.intensity,
                                            gc->mat_size);
 
-        NVML_CHECK(nvmlDeviceGetHandleByIndex(gc->device_id, &gc->nvml_dev));
-        nvmlDeviceGetPowerManagementLimit(gc->nvml_dev, &gc->tdp_mw);
+        if (gb_mon_open(gc->device_id, &gc->mon) == 0)
+            gc->tdp_mw = gb_mon_tdp_mw(&gc->mon);
 
         cudaDeviceProp prop;
         CUDA_CHECK(cudaGetDeviceProperties(&prop, gc->device_id));
@@ -1348,12 +1204,24 @@ int main(int argc, char **argv)
             printf("           %s[주의] Core DB 미등록 GPU — 동적 Peak%% 표시 불가%s\n",
                    CLR_WARN, CLR_RESET);
 
-        /* TF32 미지원 GPU에서 sgemm_tf32 실행 시 cuBLAS fallback 안내 */
+        /* TF32 미지원 GPU에서 sgemm_tf32 실행 시 BLAS fallback 안내
+           (NVIDIA Turing/Volta, AMD RDNA3 등) */
         if (cfg.prec == PREC_SGEMM_TF32
             && gc->core_info.cores_fp32 > 0
             && gc->core_info.tc_ops_tf32 == 0)
-            printf("           %s[참고] TF32 미지원 → cuBLAS가 FP32 SGEMM으로 자동 fallback "
+            printf("           %s[참고] TF32 미지원 → %s가 FP32 SGEMM으로 자동 fallback "
                    "(Peak%% 기준도 FP32 shader)%s\n",
+                   CLR_WARN, GB_BLAS_NAME, CLR_RESET);
+
+        /* CDNA(fp32_matrix_ops>0)에서 hgemm(FP16 입력/FP16 누산) 안내.
+           CDNA 의 Matrix Core(MFMA)는 FP16 입력→FP32 누산이 네이티브이고
+           FP16 누산은 네이티브 미지원 → rocBLAS 가 저속 경로로 폴백해
+           Peak% 가 낮게 나옵니다. FP16 워크로드는 hgemm_mix(FP32 누산)가
+           CDNA 의 정식 고속 경로입니다. */
+        if (cfg.prec == PREC_HGEMM
+            && gc->core_info.fp32_matrix_ops > 0)
+            printf("           %s[참고] CDNA Matrix Core는 FP16 누산 미지원 → hgemm은 "
+                   "저속 폴백. FP16 부하는 hgemm_mix(FP32 누산) 권장%s\n",
                    CLR_WARN, CLR_RESET);
 
         printf("           행렬 크기 %d x %d,  스트림 %d,  %sC ring %d 슬롯%s\n",
@@ -1551,6 +1419,6 @@ int main(int argc, char **argv)
 
     }
     free(gpus);
-    nvmlShutdown();
+    gb_mon_shutdown();
     return 0;
 }
