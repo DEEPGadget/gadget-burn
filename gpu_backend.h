@@ -99,6 +99,15 @@ typedef enum {
    BLAS / 모니터링 핸들 타입과 함수 시그니처는 backend 헤더가 정의.
    여기서는 "본체가 호출하는 함수 목록(계약)"만 문서화합니다.
 
+   [디바이스 순서]
+     void gb_init_device_order(void);
+            // GPU 열거 순서를 모니터링 도구(nvidia-smi/amd-smi)와 일치시킨다.
+            // 반드시 첫 GPU 런타임 호출(cudaGetDeviceCount 등) 이전에 부른다.
+            // NVIDIA: CUDA_DEVICE_ORDER=PCI_BUS_ID 강제. 기본 FASTEST_FIRST 는
+            //         혼합 GPU에서 CUDA index 가 nvidia-smi/NVML 과 어긋나
+            //         -g 선택과 모니터링 대상이 서로 다른 카드를 가리킴.
+            // AMD: no-op (HIP 는 이미 PCI 순서, gb_mon_open 이 BDF 로 매칭).
+
    [BLAS]
      int    gb_blas_create (gb_blas_handle_t *h, gb_stream_t stream);
      void   gb_blas_destroy(gb_blas_handle_t h);
@@ -118,6 +127,14 @@ typedef enum {
      unsigned gb_mon_clock_mhz  (gb_mon_t);       // SM/GFX clock (MHz), 실패 0
      double   gb_mon_util_pct   (gb_mon_t);       // GPU 사용률 (%), 실패 -1
      unsigned gb_mon_throttle   (gb_mon_t);       // GB_THROTTLE_* 비트마스크
+
+   [전력 캡 설정 — -P 옵션 전용, root 권한 필요]
+     int gb_mon_set_power_cap_mw(gb_mon_t*, unsigned mw);
+            // 전력 캡(TDP)을 mw [mW] 로 설정. 0=성공, -1=실패(권한 없음/미지원).
+            // NVIDIA: nvmlDeviceSetPowerManagementLimit, AMD: amdsmi_set_power_cap.
+            // 원래 캡은 본체가 gb_mon_tdp_mw() 로 미리 읽어 두었다가 종료 시 복원.
+     int gb_mon_power_cap_range_mw(gb_mon_t*, unsigned *min_mw, unsigned *max_mw);
+            // 설정 가능한 캡 범위 [mW]. 0=성공. 본체가 요청값을 이 범위로 클램프.
 
    전력 단위는 NVML(mW)에 맞춰 mW 로 통일합니다. amd_smi(W)는 backend
    에서 ×1000 변환합니다. 본체는 mW 를 받아 /1000.0 으로 W 변환합니다.

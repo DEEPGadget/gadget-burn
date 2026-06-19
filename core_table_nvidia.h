@@ -96,6 +96,10 @@
     { "GeForce RTX 2080 Ti",                    4352,  136, 544,  128,  128,    0 }, \
     { "Titan RTX",                              4608,  144, 576,  128,  128,    0 }, \
     { "GeForce RTX 2080",                       2944,   92, 368,  128,  128,    0 }, \
+    /* Volta Titan — GV100 (80 SM), V100 과 코어 스펙 동일. 차이는 VRAM/버스폭뿐  \
+       (12GB HBM2 3072-bit) 이라 CoreEntry 값은 V100 과 같다. substring "TITAN V" \
+       가 "NVIDIA TITAN V" 와 CEO Edition(32GB) 까지 매칭, "Titan RTX" 와 무충돌. */ \
+    { "TITAN V",                                5120, 2560, 640,  128,  128,    0 }, \
     /* Volta DC — GV100 (80 SM), 1st gen TC, FP16 input only, TF32 미지원.     \
        FP64=32/SM=2560 (1:2 of FP32, DC 풀 FP64). "Tesla V100"이 "V100"보다 먼저. */ \
     { "Tesla V100",                             5120, 2560, 640,  128,  128,    0 }, \

@@ -32,6 +32,20 @@ static inline gb_half gb_float2half(float f) { return __float2half(f); }
 typedef cudaStream_t gb_stream_t;
 
 /* ─────────────────────────────────────────────────────────
+   디바이스 열거 순서 정렬
+   ─────────────────────────────────────────────────────────
+   CUDA 런타임 기본값(CUDA_DEVICE_ORDER 미설정)은 FASTEST_FIRST 라
+   성능 휴리스틱으로 디바이스를 재정렬합니다. 반면 nvidia-smi/NVML 은
+   PCI 버스 순서로 열거하므로, 서로 다른 GPU 가 섞인 시스템에서는
+   CUDA index 와 nvidia-smi index 가 어긋납니다 (-g 선택과 모니터링이
+   다른 카드를 가리킴). PCI_BUS_ID 로 강제해 둘을 일치시킵니다.
+   반드시 첫 CUDA 런타임 호출 이전에 호출해야 적용됩니다. */
+static inline void gb_init_device_order(void)
+{
+    setenv("CUDA_DEVICE_ORDER", "PCI_BUS_ID", 1);
+}
+
+/* ─────────────────────────────────────────────────────────
    오류 처리 매크로 (본체에서 사용)
    ───────────────────────────────────────────────────────── */
 #define GPU_CHECK(call)                                                \
@@ -170,6 +184,24 @@ static inline unsigned gb_mon_tdp_mw(gb_mon_t *m)
     unsigned int lim = 0;  /* NVML power management limit, mW */
     if (nvmlDeviceGetPowerManagementLimit(m->dev, &lim) != NVML_SUCCESS) return 0;
     return lim;
+}
+
+/* 전력 캡(TDP) 설정. NVML 은 mW 단위. root 권한 필요(아니면 NO_PERMISSION). */
+static inline int gb_mon_set_power_cap_mw(gb_mon_t *m, unsigned mw)
+{
+    return (nvmlDeviceSetPowerManagementLimit(m->dev, mw) == NVML_SUCCESS) ? 0 : -1;
+}
+
+/* 설정 가능한 캡 범위 [mW]. 본체가 요청값을 이 범위로 클램프. */
+static inline int gb_mon_power_cap_range_mw(gb_mon_t *m,
+                                            unsigned *min_mw, unsigned *max_mw)
+{
+    unsigned int lo = 0, hi = 0;
+    if (nvmlDeviceGetPowerManagementLimitConstraints(m->dev, &lo, &hi) != NVML_SUCCESS)
+        return -1;
+    if (min_mw) *min_mw = lo;
+    if (max_mw) *max_mw = hi;
+    return 0;
 }
 
 static inline int gb_mon_temp_c(gb_mon_t *m)

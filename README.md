@@ -60,6 +60,7 @@ make amd        # AMD (빌드 머신 GPU 자동 감지)
 - **멀티벤더 단일 소스** — NVIDIA/AMD를 추상화 레이어 하나로 지원. → [아키텍처](docs/architecture.md)
 - **실측 클럭 기반 동적 Peak%** — 고정 스펙값이 아니라 실시간 클럭 × 코어 수로 이론 피크를 계산. 🟢≥70% / 🟡60~69% / 🔴<60%. → [측정 방법](docs/measurement.md)
 - **정확한 GPU별 측정** — 멀티-GPU에서 Util 교차오염을 우회(NVIDIA), device 핸들을 PCIe BDF로 매칭(AMD). → [측정 방법](docs/measurement.md)
+- **nvidia-smi와 동일한 GPU 인덱스** — NVIDIA는 `CUDA_DEVICE_ORDER=PCI_BUS_ID`를 강제해 `-g` 인덱스가 nvidia-smi/NVML과 일치(혼합 GPU 환경에서도). `-l` 출력에 PCI BDF를 함께 표시해 대조 가능.
 - **메모리 압박 패턴** — 가용 VRAM을 채우는 multi-C ring buffer + random 데이터로 메모리 컨트롤러까지 풀로드 (gpu-burn 패턴, 항상 활성).
 - **부하 자유 조절** — VRAM 비율/행렬 크기(`-m`, `-X`)와 동시 스트림 수(`-i`)로 부하를 정밀 조절.
 
@@ -86,6 +87,7 @@ make amd        # AMD (빌드 머신 GPU 자동 감지)
 | `-g <목록>` | 사용할 GPU ID (쉼표 구분) | 전체 |
 | `-X <크기>` | 행렬 크기 M override (`8192`/`16384`/`32768`) | `16384` |
 | `-I <모드>` | A,B 데이터 초기화: `memset`/`rand` | `rand` |
+| `-P <와트>` | 전력 캡(TDP) 설정 [W] (root 필요, 종료 시 복원) | — |
 | `-l` | GPU 목록 출력 후 종료 | — |
 | `-h` | 도움말 | — |
 
@@ -104,7 +106,13 @@ make amd        # AMD (빌드 머신 GPU 자동 감지)
 
 # 운영
 ./gadget_burn -g 0,1 -i 4 -t 1800      # GPU 0,1, 스트림 4개, 30분
+sudo ./gadget_burn -P 250 -t 600        # 전력 캡 250W로 10분 (root 필요)
 ```
+
+> `-P`는 GPU의 전력 캡(power management limit)을 직접 설정합니다(NVIDIA NVML /
+> AMD amd_smi). GPU 펌웨어가 그 전력 안에서 클럭을 자동 조절하므로 throttle 열의
+> `PWR` 표시는 정상입니다. 설정 가능 범위를 벗어나면 자동 클램프하며, 측정 종료·
+> 중단(Ctrl-C) 시 원래 캡으로 복원합니다. **root 권한이 필요합니다.**
 
 ## 문서
 

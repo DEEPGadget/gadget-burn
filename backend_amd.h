@@ -51,6 +51,7 @@
 #define cudaMemset               hipMemset
 #define cudaMemGetInfo           hipMemGetInfo
 #define cudaGetErrorString       hipGetErrorString
+#define cudaDeviceGetPCIBusId    hipDeviceGetPCIBusId
 
 /* 스트림 */
 #define cudaStreamCreate         hipStreamCreate
@@ -71,6 +72,11 @@ typedef __half gb_half;
 static inline gb_half gb_float2half(float f) { return __float2half(f); }
 
 typedef hipStream_t gb_stream_t;
+
+/* 디바이스 열거 순서 정렬: HIP 는 기본적으로 PCI 버스 순서로 열거되고
+   (amd-smi 와 동일), 모니터링은 gb_mon_open 이 BDF 로 직접 매칭하므로
+   추가 정렬 강제가 불필요. no-op 으로 둔다 (NVIDIA 와 인터페이스 통일). */
+static inline void gb_init_device_order(void) { (void)0; }
 
 /* ─────────────────────────────────────────────────────────
    오류 처리 매크로
@@ -310,6 +316,26 @@ static inline unsigned gb_mon_tdp_mw(gb_mon_t *m)
         return 0;
     /* baremetal: µW 단위 → mW 로 변환 */
     return (unsigned)(cap.power_cap / 1000ull);
+}
+
+/* 전력 캡(TDP) 설정. amd_smi 는 µW 단위(baremetal) → mW×1000.
+   sensor index 0 (1차 소켓 센서). root 권한 필요. */
+static inline int gb_mon_set_power_cap_mw(gb_mon_t *m, unsigned mw)
+{
+    uint64_t cap_uw = (uint64_t)mw * 1000ull;
+    return (amdsmi_set_power_cap(m->handle, 0, cap_uw) == AMDSMI_STATUS_SUCCESS) ? 0 : -1;
+}
+
+/* 설정 가능한 캡 범위 [mW]. power_cap_info 의 min/max(µW) → mW. */
+static inline int gb_mon_power_cap_range_mw(gb_mon_t *m,
+                                            unsigned *min_mw, unsigned *max_mw)
+{
+    amdsmi_power_cap_info_t cap;
+    if (amdsmi_get_power_cap_info(m->handle, 0, &cap) != AMDSMI_STATUS_SUCCESS)
+        return -1;
+    if (min_mw) *min_mw = (unsigned)(cap.min_power_cap / 1000ull);
+    if (max_mw) *max_mw = (unsigned)(cap.max_power_cap / 1000ull);
+    return 0;
 }
 
 static inline int gb_mon_temp_c(gb_mon_t *m)

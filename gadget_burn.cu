@@ -24,6 +24,7 @@
  *   -g <목록>     GPU ID 쉼표 구분                  (기본: 전체)
  *   -X <크기>     행렬 크기 M override (기본 32768, opt: 8192/16384)
  *   -I <모드>     데이터 초기화: memset (denormal) | rand (xorshift PRNG, 기본)
+ *   -P <와트>     전력 캡(TDP) 설정 [W] (root 필요, 종료 시 원래 캡 복원)
  *   -l            GPU 목록 출력 후 종료
  *   -h            도움말
  *
@@ -39,6 +40,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <time.h>
+#include <signal.h>
 
 /* 벤더 추상화 레이어. 빌드 시 -DGB_BACKEND_NVIDIA 또는 -DGB_BACKEND_AMD 로
    백엔드를 선택하면, 이 헤더가 CUDA/cuBLAS/NVML 또는 HIP/rocBLAS/amd_smi
@@ -309,6 +311,7 @@ typedef struct {
     int      num_gpus;
     int      mat_size_override; /* -X 또는 -m 절대크기: 행렬 크기 override (0이면 DEFAULT_MAT_SIZE) */
     InitMode init_mode;         /* -I: 초기화 방식 override (기본 AUTO) */
+    int      tdp_cap_w;         /* -P: 전력 캡(TDP) 목표 [W]. 0 = 미설정 */
 } Config;
 
 /* 기본 행렬 크기 (M=N=K).
@@ -345,6 +348,10 @@ typedef struct {
     /* 모니터링 핸들 (NVML / amd_smi 추상화) */
     gb_mon_t     mon;
     unsigned int tdp_mw;
+
+    /* -P 전력 캡(TDP) 설정 상태 */
+    unsigned int orig_cap_mw;   /* 변경 전 원래 전력 캡 (복원용) */
+    int          cap_applied;   /* 1 = 이 GPU에 캡을 적용함 → 종료 시 복원 */
 
     /* 코어 정보 (동적 Rpeak 계산용) */
     CoreEntry   core_info;
@@ -1000,6 +1007,9 @@ static void print_usage(const char *prog)
     printf("                 memset: cudaMemset(1) — denormal FP32 (TC switching 최소)\n");
     printf("                 rand  : xorshift PRNG로 random 데이터 (TC switching 풀가동)\n");
     printf("               비교 측정용 — 데이터 entropy가 TDP에 미치는 영향 분리 확인\n");
+    printf("  -P <와트>    전력 캡(TDP) 설정 [W] — GPU가 이 전력 안에서 운전 (root 필요)\n");
+    printf("                 GPU 펌웨어가 클럭을 자동 조절. throttle에 PWR 표시는 정상.\n");
+    printf("                 설정 가능 범위 밖이면 자동 클램프. 종료 시 원래 캡 복원.\n");
     printf("  -l           GPU 목록 출력 후 종료\n");
     printf("  -h           도움말\n\n");
     printf("예시:\n");
@@ -1011,7 +1021,8 @@ static void print_usage(const char *prog)
     printf("  %s -p sgemm_tf32 -I memset   # rand vs memset 비교 측정\n", prog);
     printf("  %s -X 8192                   # 작은 행렬 (gpu-burn 정확 모사)\n", prog);
     printf("  %s -m 50%%                   # VRAM 50%% 만 사용 (ring 슬롯 ↓)\n", prog);
-    printf("  %s -g 0,1 -i 4 -t 120      # GPU 0,1, 스트림 4개, 2분\n\n", prog);
+    printf("  %s -g 0,1 -i 4 -t 120      # GPU 0,1, 스트림 4개, 2분\n", prog);
+    printf("  sudo %s -P 250 -t 600       # 전력 캡 250W로 10분 (root 필요)\n\n", prog);
 }
 
 static void print_gpu_list(void)
@@ -1020,10 +1031,10 @@ static void print_gpu_list(void)
     CUDA_CHECK(cudaGetDeviceCount(&n));
     gb_mon_init();
 
-    printf("\n시스템 GPU 목록 (%d 개)\n", n);
-    printf("──────────────────────────────────────────────────────\n");
-    printf("  ID  이름                          VRAM        TDP\n");
-    printf("──────────────────────────────────────────────────────\n");
+    printf("\n시스템 GPU 목록 (%d 개)  ※ 인덱스는 PCI 버스 순서 = nvidia-smi/amd-smi 와 동일\n", n);
+    printf("──────────────────────────────────────────────────────────────────────\n");
+    printf("  ID  이름                          VRAM        TDP    PCI(BDF)\n");
+    printf("──────────────────────────────────────────────────────────────────────\n");
 
     for (int i = 0; i < n; i++) {
         cudaDeviceProp p;
@@ -1032,14 +1043,49 @@ static void print_gpu_list(void)
         gb_mon_t mon;
         if (gb_mon_open(i, &mon) == 0)
             tdp_mw = gb_mon_tdp_mw(&mon);
+        char bdf[32] = "?";
+        cudaDeviceGetPCIBusId(bdf, (int)sizeof(bdf), i);
         printf("  [%d]  %-28s  %5zu MiB", i, p.name,
                p.totalGlobalMem / (1024 * 1024));
         if (tdp_mw > 0) printf("  %4u W", tdp_mw / 1000);
-        printf("\n");
+        else            printf("        ");   /* TDP 자리 맞춤 (8칸) */
+        printf("   %s\n", bdf);
     }
 
-    printf("──────────────────────────────────────────────────────\n\n");
+    printf("──────────────────────────────────────────────────────────────────────\n\n");
     gb_mon_shutdown();
+}
+
+/* ─────────────────────────────────────────────────────────
+   전력 캡(TDP) 복원
+   ─────────────────────────────────────────────────────────
+   -P 로 변경한 전력 캡은 프로세스가 종료돼도 GPU에 그대로 남으므로,
+   반드시 원래 값으로 되돌려야 합니다. 정상 종료(main 끝/atexit)와
+   Ctrl-C(SIGINT)/SIGTERM 모두에서 복원합니다.
+   ───────────────────────────────────────────────────────── */
+
+static GpuCtx *g_cap_gpus     = NULL;   /* 복원 대상 GpuCtx 배열 */
+static int     g_cap_num_gpus = 0;
+
+/* 적용된 캡을 모두 원래 값으로 복원 (cap_applied 가드로 idempotent) */
+static void restore_power_caps(void)
+{
+    if (!g_cap_gpus) return;
+    for (int g = 0; g < g_cap_num_gpus; g++) {
+        GpuCtx *gc = &g_cap_gpus[g];
+        if (gc->cap_applied) {
+            gb_mon_set_power_cap_mw(&gc->mon, gc->orig_cap_mw);
+            gc->cap_applied = 0;
+        }
+    }
+}
+
+/* Ctrl-C/SIGTERM: 캡 복원 후 기본 동작으로 재발생시켜 종료 */
+static void on_terminate_signal(int signo)
+{
+    restore_power_caps();
+    signal(signo, SIG_DFL);
+    raise(signo);
 }
 
 /* ─────────────────────────────────────────────────────────
@@ -1048,6 +1094,10 @@ static void print_gpu_list(void)
 
 int main(int argc, char **argv)
 {
+    /* GPU 열거 순서를 nvidia-smi/NVML(PCI 버스 순서)과 일치시킨다.
+       반드시 첫 CUDA 런타임 호출 이전에 호출. (AMD 는 no-op) */
+    gb_init_device_order();
+
     /* 기본값 설정 */
     Config cfg;
     memset(&cfg, 0, sizeof(cfg));
@@ -1057,10 +1107,11 @@ int main(int argc, char **argv)
     cfg.mem_spec.is_percent = 1;
     cfg.mem_spec.value      = 100.0;
     cfg.init_mode           = INIT_RAND;
+    cfg.tdp_cap_w           = 0;        /* -P 미지정 */
 
     int list_only = 0;
     int opt;
-    while ((opt = getopt(argc, argv, "t:i:p:m:g:X:I:lh")) != -1) {
+    while ((opt = getopt(argc, argv, "t:i:p:m:g:X:I:P:lh")) != -1) {
         switch (opt) {
         case 't': cfg.duration_sec      = atoi(optarg);                  break;
         case 'i': cfg.intensity         = atoi(optarg);                  break;
@@ -1085,6 +1136,7 @@ int main(int argc, char **argv)
         case 'g':
             cfg.num_gpus = parse_gpu_list(optarg, cfg.gpu_ids, MAX_GPUS);
             break;
+        case 'P': cfg.tdp_cap_w          = atoi(optarg);                 break;
         case 'l': list_only = 1;                                         break;
         case 'h': print_usage(argv[0]); return 0;
         default:  print_usage(argv[0]); return 1;
@@ -1123,6 +1175,10 @@ int main(int argc, char **argv)
         fprintf(stderr, "오류: -i 범위는 1~%d 입니다.\n", MAX_INTENSITY);
         return 1;
     }
+    if (cfg.tdp_cap_w < 0) {
+        fprintf(stderr, "오류: -P 값은 양의 정수(W)여야 합니다.\n");
+        return 1;
+    }
 
     const char *prec_str[] = {
         "SGEMM (FP32)",
@@ -1151,10 +1207,23 @@ int main(int argc, char **argv)
     printf("  데이터 초기화: %s\n",
            (cfg.init_mode == INIT_MEMSET) ? "memset (denormal byte 0x01)"
                                           : "rand (xorshift32 PRNG)");
+    if (cfg.tdp_cap_w > 0)
+        printf("  TDP 캡 목표  : %d W  (전력 캡 설정 모드, root 권한 필요)\n",
+               cfg.tdp_cap_w);
     printf("╠══════════════════════════════════════════════════════════════╣\n");
 
     /* ── GPU 별 초기화 ── */
     GpuCtx *gpus = (GpuCtx *)calloc(cfg.num_gpus, sizeof(GpuCtx));
+
+    /* -P 전력 캡 사용 시: 종료/중단 시 캡을 원복하도록 훅 등록.
+       (캡은 프로세스 종료 후에도 GPU에 남으므로 반드시 복원해야 함) */
+    if (cfg.tdp_cap_w > 0) {
+        g_cap_gpus     = gpus;
+        g_cap_num_gpus = cfg.num_gpus;
+        atexit(restore_power_caps);
+        signal(SIGINT,  on_terminate_signal);
+        signal(SIGTERM, on_terminate_signal);
+    }
 
     for (int g = 0; g < cfg.num_gpus; g++) {
         GpuCtx *gc = &gpus[g];
@@ -1177,8 +1246,10 @@ int main(int argc, char **argv)
                                            cfg.prec, cfg.intensity,
                                            gc->mat_size);
 
-        if (gb_mon_open(gc->device_id, &gc->mon) == 0)
-            gc->tdp_mw = gb_mon_tdp_mw(&gc->mon);
+        if (gb_mon_open(gc->device_id, &gc->mon) == 0) {
+            gc->tdp_mw      = gb_mon_tdp_mw(&gc->mon);
+            gc->orig_cap_mw = gc->tdp_mw;   /* -P 복원용 원래 캡 */
+        }
 
         cudaDeviceProp prop;
         CUDA_CHECK(cudaGetDeviceProperties(&prop, gc->device_id));
@@ -1190,7 +1261,9 @@ int main(int argc, char **argv)
         else
             memset(&gc->core_info, 0, sizeof(CoreEntry));
 
-        printf("  [초기화] GPU %d: %s", gc->device_id, prop.name);
+        char bdf[32] = "?";
+        cudaDeviceGetPCIBusId(bdf, (int)sizeof(bdf), gc->device_id);
+        printf("  [초기화] GPU %d: %s  [%s]", gc->device_id, prop.name, bdf);
         if (gc->tdp_mw > 0) printf("  TDP %u W", gc->tdp_mw / 1000);
         printf("\n");
 
@@ -1223,6 +1296,40 @@ int main(int argc, char **argv)
             printf("           %s[참고] CDNA Matrix Core는 FP16 누산 미지원 → hgemm은 "
                    "저속 폴백. FP16 부하는 hgemm_mix(FP32 누산) 권장%s\n",
                    CLR_WARN, CLR_RESET);
+
+        /* -P: 전력 캡(TDP) 설정. root 권한 필요. orig_cap_mw 에 원래 값이
+           저장돼 있으며 종료/중단 시 restore_power_caps() 가 복원한다. */
+        if (cfg.tdp_cap_w > 0) {
+            if (!gc->mon.valid || gc->orig_cap_mw == 0) {
+                fprintf(stderr, "\n오류: GPU %d 전력 캡을 읽을 수 없어 -P 적용 불가\n",
+                        gc->device_id);
+                restore_power_caps();
+                return 1;
+            }
+            unsigned req_mw = (unsigned)cfg.tdp_cap_w * 1000u;
+            unsigned cmin = 0, cmax = 0;
+            if (gb_mon_power_cap_range_mw(&gc->mon, &cmin, &cmax) == 0 && cmax > 0) {
+                if (req_mw < cmin) {
+                    printf("           %s[TDP] 요청 %dW < 최소 %uW → %uW로 클램프%s\n",
+                           CLR_WARN, cfg.tdp_cap_w, cmin / 1000, cmin / 1000, CLR_RESET);
+                    req_mw = cmin;
+                } else if (req_mw > cmax) {
+                    printf("           %s[TDP] 요청 %dW > 최대 %uW → %uW로 클램프%s\n",
+                           CLR_WARN, cfg.tdp_cap_w, cmax / 1000, cmax / 1000, CLR_RESET);
+                    req_mw = cmax;
+                }
+            }
+            if (gb_mon_set_power_cap_mw(&gc->mon, req_mw) != 0) {
+                fprintf(stderr, "\n오류: GPU %d 전력 캡 설정 실패 — "
+                        "root 권한이 필요하거나 미지원 GPU입니다.\n", gc->device_id);
+                restore_power_caps();
+                return 1;
+            }
+            gc->cap_applied = 1;
+            gc->tdp_mw      = req_mw;   /* TDP% 기준을 설정한 캡으로 */
+            printf("           %s[TDP] 전력 캡 적용: %uW (원래 %uW)%s\n",
+                   CLR_CYAN, req_mw / 1000, gc->orig_cap_mw / 1000, CLR_RESET);
+        }
 
         printf("           행렬 크기 %d x %d,  스트림 %d,  %sC ring %d 슬롯%s\n",
                gc->mat_size, gc->mat_size, gc->intensity,
@@ -1418,6 +1525,8 @@ int main(int argc, char **argv)
         free(gpus[g].workers);
 
     }
+    restore_power_caps();   /* -P 로 변경한 전력 캡 원복 (mon 핸들 유효할 때) */
+    g_cap_gpus = NULL;      /* atexit/시그널 핸들러가 해제된 메모리를 보지 않도록 */
     free(gpus);
     gb_mon_shutdown();
     return 0;
