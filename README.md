@@ -88,6 +88,8 @@ make amd        # AMD (빌드 머신 GPU 자동 감지)
 | `-X <크기>` | 행렬 크기 M override (`8192`/`16384`/`32768`) | `16384` |
 | `-I <모드>` | A,B 데이터 초기화: `memset`/`rand` | `rand` |
 | `-P <와트>` | 전력 캡(TDP) 설정 [W] (root 필요, 종료 시 복원) | — |
+| `-o [경로]` | 측정 데이터를 CSV로 기록 (그래프용, 1Hz) | — |
+| `-S <plan>` | TDP 스윕: `W:T,...` 여러 조건 연속 실행 (root 필요) | — |
 | `-l` | GPU 목록 출력 후 종료 | — |
 | `-h` | 도움말 | — |
 
@@ -107,7 +109,28 @@ make amd        # AMD (빌드 머신 GPU 자동 감지)
 # 운영
 ./gadget_burn -g 0,1 -i 4 -t 1800      # GPU 0,1, 스트림 4개, 30분
 sudo ./gadget_burn -P 250 -t 600        # 전력 캡 250W로 10분 (root 필요)
+
+# CSV 기록 (그래프용)
+./gadget_burn -o -t 600                 # 자동 파일명 results_<host>_<시각>.csv
+./gadget_burn -o logs/ -p hgemm         # logs/ 폴더에 저장
+
+# TDP 스윕 plan (여러 조건 연속)
+sudo ./gadget_burn -S 300:10m,400:10m,600:10m -o   # 300W→400W→600W 각 10분
 ```
+
+> `-S`는 **여러 (전력 캡, 시간) 조건을 한 실행에서 연속 수행**합니다. 형식은
+> `W:T,W:T,...` (W=와트, T=시간 `s`/`m`/`h`, 기본 초). 메모리(`-m`/`-X`)와
+> 데이터타입(`-p`)은 전 구간 고정이며, `-P`·`-t`는 무시됩니다. GPU 부하는 phase가
+> 바뀌어도 끊지 않고 전력 캡만 전환합니다. 전환 직후 정착 구간(기본 5초)은 phase
+> 평균에서 제외되며(시계열 CSV에는 전부 기록), CSV에는 `phase_idx`·`phase_tdp_w`·
+> `phase_elapsed_sec` 컬럼이 추가되어 한 파일에서 phase별 비교·필터가 가능합니다.
+> **root 권한이 필요합니다.**
+
+> `-o`는 측정 구간 동안 per-GPU 지표(TFLOPS·Peak%·전력·TDP%·Util·클럭·온도·throttle·
+> VRAM)를 **1초 간격 long/tidy CSV**로 적재합니다. 파일 상단 `#` 주석에 **실행한 명령행과
+> 옵션·GPU별 이름/BDF/코어 정보**가 함께 기록되어 나중에 실험 조건을 바로 파악할 수 있고,
+> 종료 시 per-GPU 평균 요약이 footer로 추가됩니다. `#` 줄은 pandas(`read_csv(comment='#')`)·
+> gnuplot이 자동 무시하므로 그래프 작업에 지장이 없습니다. 매초 flush되어 Ctrl-C에도 직전까지 보존됩니다.
 
 > `-P`는 GPU의 전력 캡(power management limit)을 직접 설정합니다(NVIDIA NVML /
 > AMD amd_smi). GPU 펌웨어가 그 전력 안에서 클럭을 자동 조절하므로 throttle 열의

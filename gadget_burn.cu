@@ -25,6 +25,9 @@
  *   -X <크기>     행렬 크기 M override (기본 32768, opt: 8192/16384)
  *   -I <모드>     데이터 초기화: memset (denormal) | rand (xorshift PRNG, 기본)
  *   -P <와트>     전력 캡(TDP) 설정 [W] (root 필요, 종료 시 원래 캡 복원)
+ *   -o [경로]     측정 데이터를 CSV로 기록 (results_host_timestamp.csv, 그래프용)
+ *   -S <plan>     TDP 스윕: W:T[,W:T]... 여러 (전력캡,시간) 조건 연속 실행 (root 필요)
+ *                 예: -S 300:10m,400:10m,600:10m  (메모리·데이터타입은 전 구간 고정)
  *   -l            GPU 목록 출력 후 종료
  *   -h            도움말
  *
@@ -41,6 +44,8 @@
 #include <pthread.h>
 #include <time.h>
 #include <signal.h>
+#include <ctype.h>
+#include <sys/stat.h>
 
 /* 벤더 추상화 레이어. 빌드 시 -DGB_BACKEND_NVIDIA 또는 -DGB_BACKEND_AMD 로
    백엔드를 선택하면, 이 헤더가 CUDA/cuBLAS/NVML 또는 HIP/rocBLAS/amd_smi
@@ -302,6 +307,15 @@ typedef enum {
     INIT_RAND     /* xorshift32 PRNG로 random 데이터 (gpu-burn 패턴, 기본) */
 } InitMode;
 
+/* -S plan: 여러 (TDP, 시간) 조건을 한 실행에서 순차 진행 */
+#define MAX_PHASES       64
+#define PHASE_SETTLE_SEC 5   /* plan 전환 직후 평균에서 제외할 정착 구간(초) */
+
+typedef struct {
+    int tdp_w;        /* 전력 캡 [W]. (plan 항목은 항상 >0) */
+    int duration_s;   /* 이 phase 지속 시간 [초] */
+} Phase;
+
 typedef struct {
     int      duration_sec;
     int      intensity;
@@ -312,6 +326,10 @@ typedef struct {
     int      mat_size_override; /* -X 또는 -m 절대크기: 행렬 크기 override (0이면 DEFAULT_MAT_SIZE) */
     InitMode init_mode;         /* -I: 초기화 방식 override (기본 AUTO) */
     int      tdp_cap_w;         /* -P: 전력 캡(TDP) 목표 [W]. 0 = 미설정 */
+    int      csv_enable;        /* -o: CSV 기록 여부 */
+    char     csv_path[512];     /* -o 인자: 출력 경로(파일/디렉터리). 빈 문자열=자동명 */
+    Phase    plan[MAX_PHASES];  /* -S: TDP 스윕 plan */
+    int      num_phases;        /* -S phase 개수. 0 = plan 미사용(단일 실행) */
 } Config;
 
 /* 기본 행렬 크기 (M=N=K).
@@ -340,6 +358,7 @@ typedef struct {
     /* 설정 */
     int         device_id;
     int         gpu_index;
+    char        name[96];       /* cudaDeviceProp.name 캐시 (CSV/메타용) */
     int         intensity;
     PrecType    prec;
     int         mat_size;
@@ -369,6 +388,14 @@ typedef struct {
     long         util_samples;
     long         throttle_thermal_samples;     /* SW/HW thermal slowdown 감지 횟수 */
     long         throttle_powerbrake_samples;  /* HW power brake 감지 횟수 */
+
+    /* phase 경계 baseline 스냅샷 (per-phase 통계 = 현재 − baseline). plan(-S)용.
+       리셋 대신 스냅샷이라 모니터/벤치 스레드와의 race 없이 phase별 평균 산출. */
+    double       base_sum_power, base_sum_util, base_sum_temp, base_sum_clock;
+    long         base_mon_samples, base_util_samples;
+    long         base_throttle_thermal, base_throttle_power;
+    long         base_total_iters;
+    double       base_total_gpu_ms;
 
     /* 슬라이딩 윈도우 (실시간 표시용, 원형 버퍼) */
     double       win_power[MON_WIN_SIZE];
@@ -924,6 +951,357 @@ static void print_progress(int elapsed, int total,
 }
 
 /* ─────────────────────────────────────────────────────────
+   per-phase 통계 (plan 모드 / 단일 실행 공용)
+   ─────────────────────────────────────────────────────────
+   누적값 − baseline 으로 한 phase 구간의 평균을 계산합니다. 단일 실행은
+   baseline 이 0(시작) 이므로 전체 구간 평균과 동일합니다.
+   ───────────────────────────────────────────────────────── */
+typedef struct {
+    double tflops, rpeak;
+    double avg_pw, avg_util, avg_temp, avg_clk;
+    double membw, eff;
+    double th_sec, pwr_sec, th_pct, pwr_pct;
+    long   iters;
+    double wall_s;
+    long   mon_samples;
+} PhaseStat;
+
+static PhaseStat phase_stat(const GpuCtx *gc, PrecType prec, size_t bpe)
+{
+    PhaseStat s;
+    memset(&s, 0, sizeof(s));
+
+    long   d_mon  = gc->mon_samples  - gc->base_mon_samples;
+    long   d_util = gc->util_samples - gc->base_util_samples;
+    double d_pw   = gc->sum_power - gc->base_sum_power;
+    double d_ut   = gc->sum_util  - gc->base_sum_util;
+    double d_tp   = gc->sum_temp  - gc->base_sum_temp;
+    double d_ck   = gc->sum_clock - gc->base_sum_clock;
+    long   d_iter = gc->total_iters  - gc->base_total_iters;
+    double d_ms   = gc->total_gpu_ms - gc->base_total_gpu_ms;
+    long   d_thh  = gc->throttle_thermal_samples    - gc->base_throttle_thermal;
+    long   d_thp  = gc->throttle_powerbrake_samples - gc->base_throttle_power;
+
+    s.mon_samples = d_mon;
+    s.iters  = d_iter;
+    s.wall_s = d_ms * 1e-3;
+    s.avg_pw   = (d_mon  > 0) ? d_pw / d_mon  : 0.0;
+    s.avg_util = (d_util > 0) ? d_ut / d_util : 0.0;
+    s.avg_temp = (d_mon  > 0) ? d_tp / d_mon  : 0.0;
+    s.avg_clk  = (d_mon  > 0) ? d_ck / d_mon  : 0.0;
+    s.tflops   = (d_ms > 0)
+        ? 2.0 * gc->mat_size * (double)gc->mat_size * gc->mat_size * gc->intensity
+          * d_iter / (d_ms * 1e-3) * 1e-12
+        : 0.0;
+    s.rpeak = calc_dynamic_rpeak(gc, prec, s.avg_clk);
+    s.membw = (s.wall_s > 0.0)
+        ? bpe * 3.0 * gc->mat_size * (double)gc->mat_size * gc->intensity
+          * d_iter / s.wall_s * 1e-12
+        : 0.0;
+    s.eff = (s.avg_pw > 0.1) ? s.tflops / s.avg_pw : 0.0;
+    s.th_sec  = d_thh * 0.1;
+    s.pwr_sec = d_thp * 0.1;
+    s.th_pct  = (d_mon > 0) ? (double)d_thh / d_mon * 100.0 : 0.0;
+    s.pwr_pct = (d_mon > 0) ? (double)d_thp / d_mon * 100.0 : 0.0;
+    return s;
+}
+
+/* phase 시작(정착 후) baseline 스냅샷 */
+static void snapshot_baseline(GpuCtx *gc)
+{
+    gc->base_sum_power = gc->sum_power;
+    gc->base_sum_util  = gc->sum_util;
+    gc->base_sum_temp  = gc->sum_temp;
+    gc->base_sum_clock = gc->sum_clock;
+    gc->base_mon_samples      = gc->mon_samples;
+    gc->base_util_samples     = gc->util_samples;
+    gc->base_throttle_thermal = gc->throttle_thermal_samples;
+    gc->base_throttle_power   = gc->throttle_powerbrake_samples;
+    gc->base_total_iters  = gc->total_iters;
+    gc->base_total_gpu_ms = gc->total_gpu_ms;
+}
+
+/* ─────────────────────────────────────────────────────────
+   CSV 로깅 (-o)
+   ─────────────────────────────────────────────────────────
+   테스트 구간 동안 per-GPU 지표를 1Hz long/tidy CSV 로 기록합니다.
+   파일 상단에는 '#' 주석으로 실험 메타데이터(호스트·명령행·옵션·GPU 정보)를
+   남겨 나중에 조건 파악이 쉽도록 합니다 (pandas read_csv(comment='#')·gnuplot
+   가 '#' 줄 자동 무시). 본체 슬라이딩 윈도우 값만 쓰므로 백엔드 무관.
+   ───────────────────────────────────────────────────────── */
+
+static const char *prec_label(PrecType p)
+{
+    switch (p) {
+    case PREC_DGEMM:      return "DGEMM (FP64)";
+    case PREC_HGEMM:      return "HGEMM (FP16 in / FP16 acc)";
+    case PREC_HGEMM_MIX:  return "HGEMM_MIX (FP16 in / FP32 acc)";
+    case PREC_SGEMM_TF32: return "SGEMM_TF32 (FP32 storage / TF32 compute)";
+    case PREC_SGEMM:
+    default:              return "SGEMM (FP32)";
+    }
+}
+
+/* -o 경로에서 최종 CSV 파일 경로 생성.
+     비어있음            → 현재 디렉터리에 자동명
+     기존 디렉터리 / 끝'/' → 그 안에 자동명
+     그 외               → 파일명으로 그대로 사용
+   자동명: results_<hostname>_<YYYYMMDD_HHMMSS>.csv */
+static void csv_build_path(const Config *cfg, char *out, size_t outsz)
+{
+    char host[64] = "host";
+    if (gethostname(host, sizeof(host)) != 0) strcpy(host, "host");
+    host[sizeof(host) - 1] = '\0';
+    for (char *p = host; *p; p++)
+        if (!isalnum((unsigned char)*p) && *p != '.' && *p != '-' && *p != '_')
+            *p = '_';
+
+    time_t now = time(NULL);
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+    char ts[24];
+    strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", &tmv);
+
+    char autoname[160];
+    snprintf(autoname, sizeof(autoname), "results_%s_%s.csv", host, ts);
+
+    const char *path = cfg->csv_path;
+    size_t plen = strlen(path);
+    if (plen == 0) {
+        snprintf(out, outsz, "%s", autoname);
+        return;
+    }
+    struct stat st;
+    int is_dir = (path[plen - 1] == '/')
+                 || (stat(path, &st) == 0 && S_ISDIR(st.st_mode));
+    if (is_dir) {
+        const char *sep = (path[plen - 1] == '/') ? "" : "/";
+        snprintf(out, outsz, "%s%s%s", path, sep, autoname);
+    } else {
+        snprintf(out, outsz, "%s", path);
+    }
+}
+
+/* '#' 메타데이터 헤더 + CSV 컬럼 헤더 기록 */
+static void csv_write_meta(FILE *f, const Config *cfg, const char *path,
+                           const Phase *phases, int num_phases, int plan_mode,
+                           GpuCtx *gpus, int num_gpus, int argc, char **argv)
+{
+    char host[64] = "unknown";
+    if (gethostname(host, sizeof(host)) != 0) strcpy(host, "unknown");
+    host[sizeof(host) - 1] = '\0';
+
+    time_t now = time(NULL);
+    struct tm tmv;
+    localtime_r(&now, &tmv);
+    char when[32];
+    strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S", &tmv);
+
+    fprintf(f, "# gadget_burn — GPU burn-in CSV log\n");
+    fprintf(f, "# file        : %s\n", path);
+    fprintf(f, "# generated   : %s\n", when);
+    fprintf(f, "# host        : %s\n", host);
+    fprintf(f, "# command     : ");
+    for (int i = 0; i < argc; i++) fprintf(f, "%s%s", i ? " " : "", argv[i]);
+    fprintf(f, "\n");
+    fprintf(f, "# backend     : %s (%s / %s)\n",
+            GB_BACKEND_NAME, GB_BLAS_NAME, GB_MON_NAME);
+    fprintf(f, "# precision   : %s\n", prec_label(cfg->prec));
+    if (plan_mode) {
+        int total = 0;
+        for (int i = 0; i < num_phases; i++) total += phases[i].duration_s;
+        fprintf(f, "# duration_s  : %d (total of %d phases)\n", total, num_phases);
+    } else {
+        fprintf(f, "# duration_s  : %d\n", cfg->duration_sec);
+    }
+    fprintf(f, "# intensity   : %d stream(s)/GPU\n", cfg->intensity);
+    if (num_gpus > 0)
+        fprintf(f, "# matrix_size : %d (M=N=K)\n", gpus[0].mat_size);
+    if (cfg->mem_spec.is_percent)
+        fprintf(f, "# memory      : %.4g%% VRAM\n", cfg->mem_spec.value);
+    else
+        fprintf(f, "# memory      : %d x %d matrix\n",
+                (int)cfg->mem_spec.value, (int)cfg->mem_spec.value);
+    fprintf(f, "# init_mode   : %s\n",
+            (cfg->init_mode == INIT_MEMSET) ? "memset" : "rand");
+    if (plan_mode) {
+        fprintf(f, "# plan        : %d phases\n", num_phases);
+        for (int i = 0; i < num_phases; i++)
+            fprintf(f, "# phase%-2d     : tdp=%dW duration=%ds\n",
+                    i, phases[i].tdp_w, phases[i].duration_s);
+    } else if (cfg->tdp_cap_w > 0) {
+        fprintf(f, "# tdp_cap_w   : %d (requested)\n", cfg->tdp_cap_w);
+    } else {
+        fprintf(f, "# tdp_cap_w   : none\n");
+    }
+    fprintf(f, "# interval_s  : 1\n");
+    fprintf(f, "# num_gpus    : %d\n", num_gpus);
+
+    for (int g = 0; g < num_gpus; g++) {
+        GpuCtx *gc = &gpus[g];
+        char bdf[32] = "?";
+        cudaDeviceGetPCIBusId(bdf, (int)sizeof(bdf), gc->device_id);
+        fprintf(f, "# gpu%-2d      : id=%d \"%s\" bdf=%s",
+                g, gc->device_id, gc->name, bdf);
+        if (gc->tdp_mw > 0) fprintf(f, " tdp=%uW", gc->tdp_mw / 1000);
+        if (gc->core_info.cores_fp32 > 0)
+            fprintf(f, " fp32=%d fp64=%d tensor=%d",
+                    gc->core_info.cores_fp32, gc->core_info.cores_fp64,
+                    gc->core_info.cores_tensor);
+        fprintf(f, "\n");
+    }
+
+    fprintf(f, "timestamp,elapsed_sec,phase_idx,phase_tdp_w,phase_elapsed_sec,"
+               "gpu_id,gpu_name,tflops,peak_pct,rpeak_tflops,"
+               "power_w,tdp_pct,util_pct,clock_mhz,temp_c,throttle,vram_mib\n");
+}
+
+/* 한 GPU의 현재(슬라이딩 윈도우) 값을 한 행으로 기록.
+   elapsed=전체 경과초, phase_elapsed=현재 phase 내 경과초. */
+static void csv_write_row(FILE *f, const char *ts, int elapsed,
+                          int phase_idx, int phase_tdp_w, int phase_elapsed,
+                          const GpuCtx *gc, PrecType prec)
+{
+    double tflops  = calc_tflops_win(gc);
+    double pw      = win_avg_power(gc);
+    double util    = win_avg_util(gc);
+    double clk_avg = win_avg_clock(gc);
+    unsigned clk   = (unsigned)clk_avg;
+    double rpeak   = calc_dynamic_rpeak(gc, prec, clk_avg);
+
+    /* rpeak/ tdp 가 0(미등록 GPU/캡 미지원)이면 빈 칸으로 → 그래프에서 NaN 처리 */
+    char peak_s[24], rpeak_s[24], tdp_s[24];
+    if (rpeak > 0.0) {
+        snprintf(peak_s,  sizeof(peak_s),  "%.1f", tflops / rpeak * 100.0);
+        snprintf(rpeak_s, sizeof(rpeak_s), "%.0f", rpeak);
+    } else { peak_s[0] = '\0'; rpeak_s[0] = '\0'; }
+    if (gc->tdp_mw > 0)
+        snprintf(tdp_s, sizeof(tdp_s), "%.1f", pw / (gc->tdp_mw / 1000.0) * 100.0);
+    else tdp_s[0] = '\0';
+
+    const char *throt = "none";
+    if (gc->cur_throttle & GB_THROTTLE_THERMAL)          throt = "thermal";
+    else if (gc->cur_throttle & GB_THROTTLE_POWER_BRAKE) throt = "power";
+
+    char ptdp_s[16];
+    if (phase_tdp_w > 0) snprintf(ptdp_s, sizeof(ptdp_s), "%d", phase_tdp_w);
+    else ptdp_s[0] = '\0';
+
+    fprintf(f, "%s,%d,%d,%s,%d,%d,\"%s\",%.3f,%s,%s,%.1f,%s,%.1f,%u,%u,%s,%zu\n",
+            ts, elapsed, phase_idx, ptdp_s, phase_elapsed,
+            gc->device_id, gc->name,
+            tflops, peak_s, rpeak_s, pw, tdp_s, util, clk,
+            (unsigned)gc->cur_temp, throt, gc->vram_used_mb);
+}
+
+/* 파일 끝에 '#' 주석으로 phase별 per-GPU 평균 요약 기록 (phase 종료 시마다) */
+static void csv_write_phase_summary(FILE *f, int ph, const Phase *P,
+                                    const GpuCtx *gpus, const PhaseStat *ps,
+                                    int num_gpus)
+{
+    if (P->tdp_w > 0)
+        fprintf(f, "# --- summary phase%d (tdp=%dW, %ds) ---\n",
+                ph, P->tdp_w, P->duration_s);
+    else
+        fprintf(f, "# --- summary phase%d (tdp=none, %ds) ---\n",
+                ph, P->duration_s);
+    for (int g = 0; g < num_gpus; g++) {
+        const PhaseStat *s = &ps[g];
+        fprintf(f, "# gpu%-2d      : avg_tflops=%.3f avg_power_w=%.1f avg_util=%.1f "
+                   "avg_clock_mhz=%.0f avg_temp_c=%.1f throttle_thermal_s=%.1f "
+                   "throttle_power_s=%.1f total_iters=%ld\n",
+                g, s->tflops, s->avg_pw, s->avg_util, s->avg_clk, s->avg_temp,
+                s->th_sec, s->pwr_sec, s->iters);
+    }
+}
+
+/* phase 결과 박스 (콘솔). 단일 실행은 "최종 측정 결과" 박스, plan 은
+   phase 구분 헤더로 출력 (②a). */
+static void print_phase_results(int ph, int num_phases, int plan_mode,
+                                const Phase *P, const GpuCtx *gpus,
+                                const PhaseStat *ps, int num_gpus)
+{
+    if (plan_mode) {
+        printf("════════════════════════════════════════════════════════════════\n");
+        printf("  ▶ Phase %d/%d 결과  (목표 %dW, %d초)\n",
+               ph + 1, num_phases, P->tdp_w, P->duration_s);
+        printf("════════════════════════════════════════════════════════════════\n");
+    } else {
+        printf("╔══════════════════════════════════════════════════════════════╗\n");
+        printf("║                        최종 측정 결과                        ║\n");
+        printf("╠══════════════════════════════════════════════════════════════╣\n");
+    }
+
+    double grand_tflops = 0.0, grand_power = 0.0, grand_util = 0.0, grand_membw = 0.0;
+    for (int g = 0; g < num_gpus; g++) {
+        const GpuCtx    *gc = &gpus[g];
+        const PhaseStat *s  = &ps[g];
+
+        printf("  GPU %2d  %s\n", gc->device_id, gc->name);
+        printf("    ├ 행렬 크기    : %d x %d,  스트림 %d\n",
+               gc->mat_size, gc->mat_size, gc->intensity);
+        printf("    ├ 총 반복 횟수 : %ld 회\n", s->iters);
+        printf("    ├ 유효 시간    : %.3f 초\n", s->wall_s);
+        printf("    ├ VRAM 사용    : %zu MiB\n", gc->vram_used_mb);
+
+        printf("    ├ 성능         : %s%.4f TFLOPS%s", CLR_GREEN, s->tflops, CLR_RESET);
+        if (s->rpeak > 0.0) {
+            double pct = s->tflops / s->rpeak * 100.0;
+            printf("  %s%5.1f%%%s  (%.1f TFLOPS @ %.0f MHz 기준)",
+                   rpeak_color(pct), pct, CLR_RESET, s->rpeak, s->avg_clk);
+        }
+        printf("\n");
+
+        printf("    ├ 평균 전력    : %s%.1f W%s", CLR_YELLOW, s->avg_pw, CLR_RESET);
+        if (gc->tdp_mw > 0)
+            printf("  (TDP 대비 %.1f%%)", s->avg_pw / (gc->tdp_mw / 1000.0) * 100.0);
+        printf("\n");
+
+        printf("    ├ GPU 사용률   : %s%.1f %%%s\n", CLR_CYAN, s->avg_util, CLR_RESET);
+        printf("    ├ SM Clock     : %.0f MHz 평균  (종료 시 %u MHz)\n",
+               s->avg_clk, gc->cur_clock);
+        printf("    ├ 평균 온도    : %s%.1f°C%s  (종료 시 %u°C)\n",
+               temp_color(s->avg_temp), s->avg_temp, CLR_RESET, gc->cur_temp);
+
+        if (s->mon_samples > 0) {
+            const char *th_col  = (s->th_sec  > 0.0) ? CLR_RED    : "";
+            const char *pwr_col = (s->pwr_sec > 0.0) ? CLR_YELLOW : "";
+            printf("    ├ Throttle    : %s열 %.1f초 (%.1f%%)%s, "
+                   "%s전력 %.1f초 (%.1f%%)%s\n",
+                   th_col,  s->th_sec,  s->th_pct,  (s->th_sec  > 0.0) ? CLR_RESET : "",
+                   pwr_col, s->pwr_sec, s->pwr_pct, (s->pwr_sec > 0.0) ? CLR_RESET : "");
+        }
+
+        printf("    ├ 메모리 BW    : %.3f TB/s (추정)\n", s->membw);
+        printf("    └ 전력 효율    : %.4f TFLOPS/W\n", s->eff);
+
+        if (g < num_gpus - 1)
+            printf("  ──────────────────────────────────────────────────────────────\n");
+
+        grand_tflops += s->tflops;
+        grand_power  += s->avg_pw;
+        grand_util   += s->avg_util;
+        grand_membw  += s->membw;
+    }
+
+    if (num_gpus > 1) {
+        printf("  ══════════════════════════════════════════════════════════════\n");
+        printf("  전체 합산 (%d GPU)\n", num_gpus);
+        printf("    ★ 총 성능        : %s%.4f TFLOPS%s\n", CLR_GREEN,  grand_tflops, CLR_RESET);
+        printf("    ★ 총 전력        : %s%.1f W%s\n",      CLR_YELLOW, grand_power,  CLR_RESET);
+        printf("    ★ 평균 GPU 사용률: %s%.1f %%%s\n",     CLR_CYAN, grand_util / num_gpus, CLR_RESET);
+        printf("    ★ 총 메모리 BW   : %.3f TB/s (추정)\n", grand_membw);
+        if (grand_power > 0.1)
+            printf("    ★ 시스템 전력효율: %.4f TFLOPS/W\n", grand_tflops / grand_power);
+    }
+
+    if (plan_mode)
+        printf("════════════════════════════════════════════════════════════════\n\n");
+    else
+        printf("╚══════════════════════════════════════════════════════════════╝\n\n");
+}
+
+/* ─────────────────────────────────────────────────────────
    옵션 파싱 헬퍼
    ───────────────────────────────────────────────────────── */
 
@@ -959,6 +1337,43 @@ static int parse_gpu_list(const char *str, int *ids, int max_n)
     while (tok && n < max_n) {
         ids[n++] = atoi(tok);
         tok = strtok(NULL, ",");
+    }
+    free(buf);
+    return n;
+}
+
+/* -S plan 의 시간 토큰: 정수 + 선택적 s/m/h (기본 s). 실패 시 -1 */
+static int parse_duration_token(const char *t)
+{
+    char *end = NULL;
+    long  v   = strtol(t, &end, 10);
+    if (end == t || v <= 0) return -1;
+    if (*end == '\0' || *end == 's' || *end == 'S') return (int)v;
+    if (*end == 'm' || *end == 'M') return (int)(v * 60);
+    if (*end == 'h' || *end == 'H') return (int)(v * 3600);
+    return -1;
+}
+
+/* -S plan 파싱: "W:T[,W:T]..." (W=와트, T=시간 s/m/h).
+   성공 시 phase 개수, 형식 오류 시 -1. */
+static int parse_plan(const char *s, Phase *plan, int max_n)
+{
+    char *buf = strdup(s);
+    if (!buf) return -1;
+    int   n    = 0;
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, ",", &save);
+         tok && n < max_n;
+         tok = strtok_r(NULL, ",", &save)) {
+        char *colon = strchr(tok, ':');
+        if (!colon) { free(buf); return -1; }
+        *colon = '\0';
+        int w = atoi(tok);
+        int d = parse_duration_token(colon + 1);
+        if (w <= 0 || d <= 0) { free(buf); return -1; }
+        plan[n].tdp_w      = w;
+        plan[n].duration_s = d;
+        n++;
     }
     free(buf);
     return n;
@@ -1010,6 +1425,15 @@ static void print_usage(const char *prog)
     printf("  -P <와트>    전력 캡(TDP) 설정 [W] — GPU가 이 전력 안에서 운전 (root 필요)\n");
     printf("                 GPU 펌웨어가 클럭을 자동 조절. throttle에 PWR 표시는 정상.\n");
     printf("                 설정 가능 범위 밖이면 자동 클램프. 종료 시 원래 캡 복원.\n");
+    printf("  -o [경로]    측정 데이터를 CSV로 기록 (그래프용, 1Hz long/tidy 형식)\n");
+    printf("                 인자 없으면 ./results_<host>_<시각>.csv 자동 생성,\n");
+    printf("                 디렉터리를 주면 그 안에, 파일명을 주면 그 이름으로 저장.\n");
+    printf("                 파일 상단 #주석에 실험 옵션·GPU 정보 기록(pandas/gnuplot 호환).\n");
+    printf("  -S <plan>    TDP 스윕 plan: 여러 (전력캡,시간) 조건을 연속 실행 (root 필요)\n");
+    printf("                 형식 W:T[,W:T]... (W=와트, T=시간 s/m/h, 기본 초)\n");
+    printf("                 예: -S 300:10m,400:10m,600:10m  (300W→400W→600W 각 10분)\n");
+    printf("                 메모리(-m/-X)·데이터타입(-p)은 전 구간 고정. -P/-t 는 무시.\n");
+    printf("                 CSV(-o) 사용 시 phase_idx/phase_tdp_w 컬럼으로 자동 구분.\n");
     printf("  -l           GPU 목록 출력 후 종료\n");
     printf("  -h           도움말\n\n");
     printf("예시:\n");
@@ -1022,7 +1446,10 @@ static void print_usage(const char *prog)
     printf("  %s -X 8192                   # 작은 행렬 (gpu-burn 정확 모사)\n", prog);
     printf("  %s -m 50%%                   # VRAM 50%% 만 사용 (ring 슬롯 ↓)\n", prog);
     printf("  %s -g 0,1 -i 4 -t 120      # GPU 0,1, 스트림 4개, 2분\n", prog);
-    printf("  sudo %s -P 250 -t 600       # 전력 캡 250W로 10분 (root 필요)\n\n", prog);
+    printf("  sudo %s -P 250 -t 600       # 전력 캡 250W로 10분 (root 필요)\n", prog);
+    printf("  %s -o -t 600              # CSV 기록하며 10분 측정 (자동 파일명)\n", prog);
+    printf("  %s -o logs/ -p hgemm       # logs/ 폴더에 CSV 저장하며 측정\n", prog);
+    printf("  sudo %s -S 300:10m,400:10m,600:10m -o   # TDP 스윕 + CSV 기록\n\n", prog);
 }
 
 static void print_gpu_list(void)
@@ -1088,6 +1515,40 @@ static void on_terminate_signal(int signo)
     raise(signo);
 }
 
+/* GPU 에 전력 캡 적용 (범위 클램프 포함). 성공 0, 실패 -1.
+   성공 시 cap_applied=1, tdp_mw=적용값(TDP% 기준). ind 는 메시지 들여쓰기.
+   단일 -P(init) 와 plan(-S) phase 전환에서 공용. */
+static int apply_power_cap(GpuCtx *gc, int watts, const char *ind)
+{
+    if (!gc->mon.valid || gc->orig_cap_mw == 0) {
+        fprintf(stderr, "\n오류: GPU %d 전력 캡을 읽을 수 없어 적용 불가\n", gc->device_id);
+        return -1;
+    }
+    unsigned req_mw = (unsigned)watts * 1000u;
+    unsigned cmin = 0, cmax = 0;
+    if (gb_mon_power_cap_range_mw(&gc->mon, &cmin, &cmax) == 0 && cmax > 0) {
+        if (req_mw < cmin) {
+            printf("%s%s[TDP] GPU %d 요청 %dW < 최소 %uW → %uW로 클램프%s\n",
+                   ind, CLR_WARN, gc->device_id, watts, cmin / 1000, cmin / 1000, CLR_RESET);
+            req_mw = cmin;
+        } else if (req_mw > cmax) {
+            printf("%s%s[TDP] GPU %d 요청 %dW > 최대 %uW → %uW로 클램프%s\n",
+                   ind, CLR_WARN, gc->device_id, watts, cmax / 1000, cmax / 1000, CLR_RESET);
+            req_mw = cmax;
+        }
+    }
+    if (gb_mon_set_power_cap_mw(&gc->mon, req_mw) != 0) {
+        fprintf(stderr, "\n오류: GPU %d 전력 캡 설정 실패 — "
+                "root 권한이 필요하거나 미지원 GPU입니다.\n", gc->device_id);
+        return -1;
+    }
+    gc->cap_applied = 1;
+    gc->tdp_mw      = req_mw;
+    printf("%s%s[TDP] GPU %d 전력 캡 적용: %uW (원래 %uW)%s\n",
+           ind, CLR_CYAN, gc->device_id, req_mw / 1000, gc->orig_cap_mw / 1000, CLR_RESET);
+    return 0;
+}
+
 /* ─────────────────────────────────────────────────────────
    main
    ───────────────────────────────────────────────────────── */
@@ -1111,7 +1572,7 @@ int main(int argc, char **argv)
 
     int list_only = 0;
     int opt;
-    while ((opt = getopt(argc, argv, "t:i:p:m:g:X:I:P:lh")) != -1) {
+    while ((opt = getopt(argc, argv, "t:i:p:m:g:X:I:P:o::S:lh")) != -1) {
         switch (opt) {
         case 't': cfg.duration_sec      = atoi(optarg);                  break;
         case 'i': cfg.intensity         = atoi(optarg);                  break;
@@ -1137,6 +1598,27 @@ int main(int argc, char **argv)
             cfg.num_gpus = parse_gpu_list(optarg, cfg.gpu_ids, MAX_GPUS);
             break;
         case 'P': cfg.tdp_cap_w          = atoi(optarg);                 break;
+        case 'o':
+            /* -o (인자 없음) → 자동명. -oPATH 또는 -o PATH → 경로 지정.
+               getopt o:: 는 공백 분리 인자를 안 받으므로 다음 argv를 직접 확인. */
+            cfg.csv_enable = 1;
+            if (optarg)
+                snprintf(cfg.csv_path, sizeof(cfg.csv_path), "%s", optarg);
+            else if (optind < argc && argv[optind] && argv[optind][0] != '-') {
+                snprintf(cfg.csv_path, sizeof(cfg.csv_path), "%s", argv[optind]);
+                optind++;
+            }
+            break;
+        case 'S': {
+            int n = parse_plan(optarg, cfg.plan, MAX_PHASES);
+            if (n <= 0) {
+                fprintf(stderr, "오류: -S 형식 오류. 예: -S 300:10m,400:10m,600:10m\n"
+                                "      (W:T 쌍을 쉼표로, 시간은 s/m/h 접미사, 기본 초)\n");
+                return 1;
+            }
+            cfg.num_phases = n;
+            break;
+        }
         case 'l': list_only = 1;                                         break;
         case 'h': print_usage(argv[0]); return 0;
         default:  print_usage(argv[0]); return 1;
@@ -1179,6 +1661,12 @@ int main(int argc, char **argv)
         fprintf(stderr, "오류: -P 값은 양의 정수(W)여야 합니다.\n");
         return 1;
     }
+    /* plan(-S)이 있으면 -P/-t 는 plan 이 대체하므로 무시 */
+    if (cfg.num_phases > 0 && cfg.tdp_cap_w > 0) {
+        fprintf(stderr, "%s[참고] -S(plan) 사용 시 -P 는 무시됩니다 "
+                        "(전력 캡은 plan 의 phase 값 사용).%s\n", CLR_WARN, CLR_RESET);
+        cfg.tdp_cap_w = 0;
+    }
 
     const char *prec_str[] = {
         "SGEMM (FP32)",
@@ -1199,7 +1687,17 @@ int main(int argc, char **argv)
         printf("  행렬 크기    : %d x %d  (M=N=K)\n",
                (int)cfg.mem_spec.value, (int)cfg.mem_spec.value);
     printf("  GPU 당 강도  : %d 스트림\n", cfg.intensity);
-    printf("  측정 시간    : %d 초\n", cfg.duration_sec);
+    if (cfg.num_phases > 0) {
+        int total = 0;
+        for (int i = 0; i < cfg.num_phases; i++) total += cfg.plan[i].duration_s;
+        printf("  실행 plan    : %d phases, 총 %d초  (TDP 캡 변경 → root 권한 필요)\n",
+               cfg.num_phases, total);
+        for (int i = 0; i < cfg.num_phases; i++)
+            printf("                 phase %d: %dW × %d초\n",
+                   i + 1, cfg.plan[i].tdp_w, cfg.plan[i].duration_s);
+    } else {
+        printf("  측정 시간    : %d 초\n", cfg.duration_sec);
+    }
     printf("  사용 GPU     : %d 개  [", cfg.num_gpus);
     for (int g = 0; g < cfg.num_gpus; g++)
         printf("%s%d", g ? "," : "", cfg.gpu_ids[g]);
@@ -1215,9 +1713,9 @@ int main(int argc, char **argv)
     /* ── GPU 별 초기화 ── */
     GpuCtx *gpus = (GpuCtx *)calloc(cfg.num_gpus, sizeof(GpuCtx));
 
-    /* -P 전력 캡 사용 시: 종료/중단 시 캡을 원복하도록 훅 등록.
+    /* 전력 캡(-P 또는 -S plan) 사용 시: 종료/중단 시 캡을 원복하도록 훅 등록.
        (캡은 프로세스 종료 후에도 GPU에 남으므로 반드시 복원해야 함) */
-    if (cfg.tdp_cap_w > 0) {
+    if (cfg.tdp_cap_w > 0 || cfg.num_phases > 0) {
         g_cap_gpus     = gpus;
         g_cap_num_gpus = cfg.num_gpus;
         atexit(restore_power_caps);
@@ -1253,6 +1751,7 @@ int main(int argc, char **argv)
 
         cudaDeviceProp prop;
         CUDA_CHECK(cudaGetDeviceProperties(&prop, gc->device_id));
+        snprintf(gc->name, sizeof(gc->name), "%s", prop.name);  /* CSV/메타용 캐시 */
 
         /* 코어 정보 조회 및 캐싱 */
         const CoreEntry *ce = core_find(prop.name);
@@ -1297,38 +1796,14 @@ int main(int argc, char **argv)
                    "저속 폴백. FP16 부하는 hgemm_mix(FP32 누산) 권장%s\n",
                    CLR_WARN, CLR_RESET);
 
-        /* -P: 전력 캡(TDP) 설정. root 권한 필요. orig_cap_mw 에 원래 값이
-           저장돼 있으며 종료/중단 시 restore_power_caps() 가 복원한다. */
-        if (cfg.tdp_cap_w > 0) {
-            if (!gc->mon.valid || gc->orig_cap_mw == 0) {
-                fprintf(stderr, "\n오류: GPU %d 전력 캡을 읽을 수 없어 -P 적용 불가\n",
-                        gc->device_id);
+        /* -P (단일 캡): plan(-S) 모드가 아니면 여기서 적용.
+           plan 모드는 phase 별로 캡이 바뀌므로 phase 루프에서 적용한다.
+           orig_cap_mw 는 종료/중단 시 restore_power_caps() 가 복원. */
+        if (cfg.tdp_cap_w > 0 && cfg.num_phases == 0) {
+            if (apply_power_cap(gc, cfg.tdp_cap_w, "           ") != 0) {
                 restore_power_caps();
                 return 1;
             }
-            unsigned req_mw = (unsigned)cfg.tdp_cap_w * 1000u;
-            unsigned cmin = 0, cmax = 0;
-            if (gb_mon_power_cap_range_mw(&gc->mon, &cmin, &cmax) == 0 && cmax > 0) {
-                if (req_mw < cmin) {
-                    printf("           %s[TDP] 요청 %dW < 최소 %uW → %uW로 클램프%s\n",
-                           CLR_WARN, cfg.tdp_cap_w, cmin / 1000, cmin / 1000, CLR_RESET);
-                    req_mw = cmin;
-                } else if (req_mw > cmax) {
-                    printf("           %s[TDP] 요청 %dW > 최대 %uW → %uW로 클램프%s\n",
-                           CLR_WARN, cfg.tdp_cap_w, cmax / 1000, cmax / 1000, CLR_RESET);
-                    req_mw = cmax;
-                }
-            }
-            if (gb_mon_set_power_cap_mw(&gc->mon, req_mw) != 0) {
-                fprintf(stderr, "\n오류: GPU %d 전력 캡 설정 실패 — "
-                        "root 권한이 필요하거나 미지원 GPU입니다.\n", gc->device_id);
-                restore_power_caps();
-                return 1;
-            }
-            gc->cap_applied = 1;
-            gc->tdp_mw      = req_mw;   /* TDP% 기준을 설정한 캡으로 */
-            printf("           %s[TDP] 전력 캡 적용: %uW (원래 %uW)%s\n",
-                   CLR_CYAN, req_mw / 1000, gc->orig_cap_mw / 1000, CLR_RESET);
         }
 
         printf("           행렬 크기 %d x %d,  스트림 %d,  %sC ring %d 슬롯%s\n",
@@ -1354,16 +1829,54 @@ int main(int argc, char **argv)
         CUDA_CHECK(cudaDeviceSynchronize());
     }
 
+    /* ── 실행 phase 목록 구성 ──
+       -S 가 있으면 그대로, 없으면 단일 phase (tdp=-P 값(없으면 0), duration=-t). */
+    Phase  phases[MAX_PHASES];
+    int    num_phases;
+    int    plan_mode = (cfg.num_phases > 0);
+    if (plan_mode) {
+        num_phases = cfg.num_phases;
+        memcpy(phases, cfg.plan, sizeof(Phase) * num_phases);
+    } else {
+        num_phases = 1;
+        phases[0].tdp_w      = cfg.tdp_cap_w;   /* 0 이면 캡 미설정 */
+        phases[0].duration_s = cfg.duration_sec;
+    }
+
+    /* bytes/element (메모리 BW 추정 등에 사용) */
+    size_t bpe;
+    switch (cfg.prec) {
+        case PREC_DGEMM:     bpe = 8; break;
+        case PREC_HGEMM:
+        case PREC_HGEMM_MIX: bpe = 2; break;
+        default:             bpe = 4; break;
+    }
+
+    /* CSV 로깅 파일 오픈 (-o). GPU 초기화 후라 이름·BDF·TDP캡이 모두 확정됨. */
+    FILE *csv = NULL;
+    char  csv_path[640] = "";
+    if (cfg.csv_enable) {
+        csv_build_path(&cfg, csv_path, sizeof(csv_path));
+        csv = fopen(csv_path, "w");
+        if (!csv)
+            fprintf(stderr, "  %s[CSV 경고] '%s' 열기 실패 — CSV 기록 비활성화%s\n",
+                    CLR_WARN, csv_path, CLR_RESET);
+        else {
+            csv_write_meta(csv, &cfg, csv_path, phases, num_phases, plan_mode,
+                           gpus, cfg.num_gpus, argc, argv);
+            fflush(csv);
+            printf("  CSV 기록     : %s\n", csv_path);
+        }
+    }
+
     printf("╠══════════════════════════════════════════════════════════════╣\n");
     printf("  측정 시작\n");
     fflush(stdout);
 
-    double t_start = now_sec();
-    double t_end   = t_start + cfg.duration_sec;
-
-    /* ── 스레드 시작 ──
+    /* ── 스레드 시작 (한 번만; phase 가 바뀌어도 GEMM 부하는 끊지 않음) ──
        monitor_thread를 먼저 시작하고 150ms 대기(첫 샘플 확보)한 뒤
        bench_thread를 시작해 cur_util 초기값 레이스 컨디션을 방지 */
+    double overall_start = now_sec();
     for (int g = 0; g < cfg.num_gpus; g++) {
         gpus[g].mon_running = 1;
         pthread_create(&gpus[g].mon_tid, NULL, monitor_thread, &gpus[g]);
@@ -1374,28 +1887,84 @@ int main(int argc, char **argv)
         pthread_create(&gpus[g].bench_tid, NULL, bench_thread, &gpus[g]);
     }
 
-    /* print_progress가 덮어쓸 줄 미리 확보: 진행막대+헤더+구분선+GPU행 = N+3 */
-    for (int i = 0; i < cfg.num_gpus + 3; i++) printf("\n");
-    fflush(stdout);
+    /* ── phase 루프: 각 phase = (전력 캡, 시간) 한 조건을 연속 수행 ──
+       단일 실행은 phase 1개로 동일 경로를 탄다. */
+    int fatal = 0;
+    for (int ph = 0; ph < num_phases && !fatal; ph++) {
+        Phase *P = &phases[ph];
 
-    /* ── 메인 루프: 1초마다 진행 상황 출력 ── */
-    int last_elapsed = -1;
-    while (now_sec() < t_end) {
-        int elapsed = (int)(now_sec() - t_start);
-        if (elapsed != last_elapsed) {
-            last_elapsed = elapsed;
+        /* plan 모드: 이 phase 의 전력 캡 적용 (단일 모드는 init 에서 이미 적용) */
+        if (plan_mode && P->tdp_w > 0) {
+            printf("\n");
+            for (int g = 0; g < cfg.num_gpus; g++)
+                if (apply_power_cap(&gpus[g], P->tdp_w, "  ") != 0) { fatal = 1; break; }
+            if (fatal) break;
+        }
 
-            double total_tflops = 0.0, total_power = 0.0;
-            for (int g = 0; g < cfg.num_gpus; g++) {
-                total_tflops += calc_tflops_win(&gpus[g]);
-                total_power  += win_avg_power(&gpus[g]);
+        if (plan_mode)
+            printf("\n── Phase %d/%d : 목표 %dW, %d초 ──\n",
+                   ph + 1, num_phases, P->tdp_w, P->duration_s);
+
+        /* 전환 직후 정착(settle) 구간은 phase 평균에서 제외 (③b).
+           CSV 시계열에는 settle 구간도 전부 기록된다. */
+        int settle_eff = (plan_mode && P->duration_s > 2 * PHASE_SETTLE_SEC)
+                         ? PHASE_SETTLE_SEC : 0;
+        int baselined = 0;
+
+        /* print_progress 가 덮어쓸 줄 미리 확보: 막대+헤더+구분선+GPU행 = N+3 */
+        for (int i = 0; i < cfg.num_gpus + 3; i++) printf("\n");
+        fflush(stdout);
+
+        double p_start = now_sec();
+        double p_end   = p_start + P->duration_s;
+        int    last_pe = -1;
+        while (now_sec() < p_end) {
+            double tnow = now_sec();
+            int pe = (int)(tnow - p_start);        /* phase-local 경과 */
+            int ge = (int)(tnow - overall_start);  /* 전체 경과 */
+
+            if (!baselined && pe >= settle_eff) {
+                for (int g = 0; g < cfg.num_gpus; g++) snapshot_baseline(&gpus[g]);
+                baselined = 1;
             }
 
-            print_progress(elapsed, cfg.duration_sec,
-                           cfg.num_gpus, gpus, cfg.prec,
-                           total_tflops, total_power);
+            if (pe != last_pe) {
+                last_pe = pe;
+                double total_tflops = 0.0, total_power = 0.0;
+                for (int g = 0; g < cfg.num_gpus; g++) {
+                    total_tflops += calc_tflops_win(&gpus[g]);
+                    total_power  += win_avg_power(&gpus[g]);
+                }
+                print_progress(pe, P->duration_s, cfg.num_gpus, gpus, cfg.prec,
+                               total_tflops, total_power);
+
+                /* CSV 행 기록 (1Hz). 매초 flush 로 중단/크래시에도 직전까지 보존. */
+                if (csv) {
+                    time_t wc = time(NULL);
+                    struct tm tv;
+                    localtime_r(&wc, &tv);
+                    char wcs[24];
+                    strftime(wcs, sizeof(wcs), "%Y-%m-%d %H:%M:%S", &tv);
+                    for (int g = 0; g < cfg.num_gpus; g++)
+                        csv_write_row(csv, wcs, ge, ph, P->tdp_w, pe,
+                                      &gpus[g], cfg.prec);
+                    fflush(csv);
+                }
+            }
+            usleep(200 * 1000);
         }
-        usleep(200 * 1000);
+        if (!baselined)   /* 매우 짧은 phase 안전망 */
+            for (int g = 0; g < cfg.num_gpus; g++) snapshot_baseline(&gpus[g]);
+
+        printf("\n\n");
+
+        /* phase 종료 시점에 통계 캡처(스레드는 계속 도므로 즉시) 후 출력 */
+        PhaseStat ps[MAX_GPUS];
+        for (int g = 0; g < cfg.num_gpus; g++)
+            ps[g] = phase_stat(&gpus[g], cfg.prec, bpe);
+        print_phase_results(ph, num_phases, plan_mode, P, gpus, ps, cfg.num_gpus);
+        if (csv)
+            csv_write_phase_summary(csv, ph, P, gpus, ps, cfg.num_gpus);
     }
 
     /* ── 스레드 종료 ── */
@@ -1407,115 +1976,13 @@ int main(int argc, char **argv)
         gpus[g].mon_running = 0;
         pthread_join(gpus[g].mon_tid, NULL);
     }
-    printf("\n\n");
 
-    /* ── 최종 결과 출력 ── */
-    size_t bpe;
-    switch (cfg.prec) {
-        case PREC_DGEMM:     bpe = 8; break;
-        case PREC_HGEMM:
-        case PREC_HGEMM_MIX: bpe = 2; break;
-        default:             bpe = 4; break;
+    /* CSV: phase 요약은 phase 마다 기록되었으므로 여기선 닫기만 한다.
+       Ctrl-C 중단 시엔 매초 flush 된 시계열 + 완료된 phase 요약까지 보존됨. */
+    if (csv) {
+        fclose(csv);
+        printf("  CSV 저장 완료: %s\n\n", csv_path);
     }
-
-    double grand_tflops = 0.0, grand_power = 0.0;
-    double grand_util   = 0.0, grand_membw = 0.0;
-
-    printf("╔══════════════════════════════════════════════════════════════╗\n");
-    printf("║                        최종 측정 결과                        ║\n");
-    printf("╠══════════════════════════════════════════════════════════════╣\n");
-
-    for (int g = 0; g < cfg.num_gpus; g++) {
-        GpuCtx *gc = &gpus[g];
-
-        double wall_sec  = gc->total_gpu_ms * 1e-3;
-        double tflops    = calc_tflops_all(gc);
-        double avg_pw    = (gc->mon_samples > 0)  ? gc->sum_power / gc->mon_samples  : 0.0;
-        double avg_util  = (gc->util_samples > 0) ? gc->sum_util  / gc->util_samples : 0.0;
-        double avg_temp  = (gc->mon_samples > 0)  ? gc->sum_temp  / gc->mon_samples  : 0.0;
-        double avg_clock = (gc->mon_samples > 0)  ? gc->sum_clock / gc->mon_samples  : 0.0;
-        double membw     = (wall_sec > 0)
-            ? bpe * 3.0 * gc->mat_size * (double)gc->mat_size * gc->intensity
-              * gc->total_iters / wall_sec * 1e-12
-            : 0.0;
-        double eff = (avg_pw > 0.1) ? tflops / avg_pw : 0.0;
-
-        /* 최종 결과: 전체 구간 평균 클럭 기반 동적 Rpeak */
-        double rpeak = calc_dynamic_rpeak(gc, cfg.prec, avg_clock);
-
-        cudaDeviceProp prop;
-        cudaGetDeviceProperties(&prop, gc->device_id);
-
-        printf("  GPU %2d  %s\n", gc->device_id, prop.name);
-        printf("    ├ 행렬 크기    : %d x %d,  스트림 %d\n",
-               gc->mat_size, gc->mat_size, gc->intensity);
-        printf("    ├ 총 반복 횟수 : %ld 회\n", gc->total_iters);
-        printf("    ├ 유효 시간    : %.3f 초\n", wall_sec);
-        printf("    ├ VRAM 사용    : %zu MiB\n", gc->vram_used_mb);
-
-        printf("    ├ 성능         : %s%.4f TFLOPS%s", CLR_GREEN, tflops, CLR_RESET);
-        if (rpeak > 0.0) {
-            double pct = tflops / rpeak * 100.0;
-            printf("  %s%5.1f%%%s  (%.1f TFLOPS @ %.0f MHz 기준)",
-                   rpeak_color(pct), pct, CLR_RESET, rpeak, avg_clock);
-        }
-        printf("\n");
-
-        printf("    ├ 평균 전력    : %s%.1f W%s", CLR_YELLOW, avg_pw, CLR_RESET);
-        if (gc->tdp_mw > 0)
-            printf("  (TDP 대비 %.1f%%)", avg_pw / (gc->tdp_mw / 1000.0) * 100.0);
-        printf("\n");
-
-        printf("    ├ GPU 사용률   : %s%.1f %%%s\n", CLR_CYAN, avg_util, CLR_RESET);
-        printf("    ├ SM Clock     : %.0f MHz 평균  (종료 시 %u MHz)\n",
-               avg_clock, gc->cur_clock);
-        printf("    ├ 평균 온도    : %s%.1f°C%s  (종료 시 %u°C)\n",
-               temp_color(avg_temp), avg_temp, CLR_RESET, gc->cur_temp);
-
-        /* Throttle 누적: 100ms 폴링 기준 → samples × 0.1초 */
-        if (gc->mon_samples > 0) {
-            double th_sec  = gc->throttle_thermal_samples * 0.1;
-            double pwr_sec = gc->throttle_powerbrake_samples * 0.1;
-            double th_pct  = (double)gc->throttle_thermal_samples
-                             / gc->mon_samples * 100.0;
-            double pwr_pct = (double)gc->throttle_powerbrake_samples
-                             / gc->mon_samples * 100.0;
-            const char *th_col  = (th_sec  > 0.0) ? CLR_RED    : "";
-            const char *pwr_col = (pwr_sec > 0.0) ? CLR_YELLOW : "";
-            printf("    ├ Throttle    : %s열 %.1f초 (%.1f%%)%s, "
-                   "%s전력 %.1f초 (%.1f%%)%s\n",
-                   th_col,  th_sec,  th_pct,  (th_sec  > 0.0) ? CLR_RESET : "",
-                   pwr_col, pwr_sec, pwr_pct, (pwr_sec > 0.0) ? CLR_RESET : "");
-        }
-
-        printf("    ├ 메모리 BW    : %.3f TB/s (추정)\n", membw);
-        printf("    └ 전력 효율    : %.4f TFLOPS/W\n", eff);
-
-        if (g < cfg.num_gpus - 1)
-            printf("  ──────────────────────────────────────────────────────────────\n");
-
-        grand_tflops += tflops;
-        grand_power  += avg_pw;
-        grand_util   += avg_util;
-        grand_membw  += membw;
-    }
-
-    if (cfg.num_gpus > 1) {
-        printf("  ══════════════════════════════════════════════════════════════\n");
-        printf("  전체 합산 (%d GPU)\n", cfg.num_gpus);
-        printf("    ★ 총 성능        : %s%.4f TFLOPS%s\n",
-               CLR_GREEN,  grand_tflops, CLR_RESET);
-        printf("    ★ 총 전력        : %s%.1f W%s\n",
-               CLR_YELLOW, grand_power,  CLR_RESET);
-        printf("    ★ 평균 GPU 사용률: %s%.1f %%%s\n",
-               CLR_CYAN, grand_util / cfg.num_gpus, CLR_RESET);
-        printf("    ★ 총 메모리 BW   : %.3f TB/s (추정)\n", grand_membw);
-        if (grand_power > 0.1)
-            printf("    ★ 시스템 전력효율: %.4f TFLOPS/W\n",
-                   grand_tflops / grand_power);
-    }
-
-    printf("╚══════════════════════════════════════════════════════════════╝\n\n");
 
     /* ── 정리 ── */
     for (int g = 0; g < cfg.num_gpus; g++) {
@@ -1525,9 +1992,9 @@ int main(int argc, char **argv)
         free(gpus[g].workers);
 
     }
-    restore_power_caps();   /* -P 로 변경한 전력 캡 원복 (mon 핸들 유효할 때) */
+    restore_power_caps();   /* -P/-S 로 변경한 전력 캡 원복 (mon 핸들 유효할 때) */
     g_cap_gpus = NULL;      /* atexit/시그널 핸들러가 해제된 메모리를 보지 않도록 */
     free(gpus);
     gb_mon_shutdown();
-    return 0;
+    return fatal ? 1 : 0;   /* plan phase 캡 적용 실패 시 비정상 종료 코드 */
 }

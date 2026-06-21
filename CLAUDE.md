@@ -37,7 +37,9 @@ make info                     # 바이너리에 포함된 GPU 코드 목록(NVID
 
 주요 옵션: `-t`(초) `-i`(동시 스트림 수) `-p`(정밀도) `-m`(VRAM% 또는 행렬크기)
 `-g`(GPU ID 목록) `-X`(행렬 크기 M override) `-I`(memset|rand 초기화)
-`-P`(전력 캡/TDP 설정 [W], root 필요·종료 시 복원).
+`-P`(전력 캡/TDP 설정 [W], root 필요·종료 시 복원)
+`-o`(CSV 기록 [경로], 1Hz long/tidy + `#` 메타 헤더, pandas/gnuplot 호환)
+`-S`(TDP 스윕 plan `W:T,...`, 여러 조건 연속 실행; 메모리·데이터타입 고정, root 필요).
 
 ## 아키텍처
 
