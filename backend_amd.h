@@ -338,17 +338,23 @@ static inline int gb_mon_power_cap_range_mw(gb_mon_t *m,
     return 0;
 }
 
-static inline int gb_mon_temp_c(gb_mon_t *m)
+/* edge(표면)·junction(hotspot) 온도를 동시 조회.
+   RDNA/CDNA 모두 두 센서를 노출한다. edge 는 카드 표면(만졌을 때 체감)에,
+   hotspot 은 다이 국소 최고점에 해당해 부하 시 edge 보다 30~50°C 높다. */
+static inline int gb_mon_temp2_c(gb_mon_t *m, int *edge_c, int *hot_c)
 {
     int64_t t = 0;
-    /* hotspot(junction) 우선, 실패 시 edge */
-    if (amdsmi_get_temp_metric(m->handle, AMDSMI_TEMPERATURE_TYPE_HOTSPOT,
-                               AMDSMI_TEMP_CURRENT, &t) == AMDSMI_STATUS_SUCCESS)
-        return (int)t;
+    int e = -1, h = -1;
     if (amdsmi_get_temp_metric(m->handle, AMDSMI_TEMPERATURE_TYPE_EDGE,
                                AMDSMI_TEMP_CURRENT, &t) == AMDSMI_STATUS_SUCCESS)
-        return (int)t;
-    return -1;
+        e = (int)t;
+    if (amdsmi_get_temp_metric(m->handle, AMDSMI_TEMPERATURE_TYPE_HOTSPOT,
+                               AMDSMI_TEMP_CURRENT, &t) == AMDSMI_STATUS_SUCCESS)
+        h = (int)t;
+    if (e < 0 && h >= 0) e = h;   /* edge 미지원 시 hotspot 으로 폴백 */
+    if (edge_c) *edge_c = e;
+    if (hot_c)  *hot_c  = h;
+    return (e >= 0) ? 0 : -1;
 }
 
 static inline unsigned gb_mon_clock_mhz(gb_mon_t *m)

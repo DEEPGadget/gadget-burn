@@ -71,15 +71,28 @@ NVIDIA의 `nvmlDeviceGetUtilizationRates()`는 드라이버 내부 전역 공유
 
 `nvmlDeviceGetClockInfo(NVML_CLOCK_SM)` / `amdsmi_get_clock_info(AMDSMI_CLK_TYPE_GFX)`로 현재 동작 주파수를 측정합니다. 이 클럭은 Peak% 계산에도 직접 사용됩니다. 실시간은 최근 10초 평균, 최종은 전체 구간 평균과 종료 시점 순간값을 함께 표시합니다.
 
-## 온도 (°C)
+## 온도 (°C) — edge / junction 동시 표시
 
-`nvmlDeviceGetTemperature(NVML_TEMPERATURE_GPU)` / `amdsmi_get_temp_metric(HOTSPOT, CURRENT)`로 측정합니다. 온도는 항상 **현재값(실시간)**을 표시하며, 최종 결과에는 전체 구간 평균과 종료 시점 값을 함께 표시합니다.
+`gb_mon_temp2_c()`로 **edge(표면)와 junction(hotspot) 두 센서를 동시** 조회해
+`edge/junction°C` 형식(예: `41/89°C`)으로 표시합니다. 온도는 항상 **현재값(실시간)**을
+표시하며, 최종 결과에는 각 센서의 전체 구간 평균과 종료 시점 값을 함께 표시합니다.
 
-| 온도 | 색상 | 의미 |
+| 벤더 | edge | junction |
 |---|---|---|
-| < 65°C | 🟢 초록 | 정상 |
-| 65~74°C | 🟠 주황 | 주의 |
-| ≥ 75°C | 🔴 빨강 | 고온 경고 |
+| NVIDIA | `nvmlDeviceGetTemperature(NVML_TEMPERATURE_GPU)` | 대개 NVML 미노출 → **N/A** (`-`로 표시) |
+| AMD | `amdsmi_get_temp_metric(EDGE, CURRENT)` | `amdsmi_get_temp_metric(HOTSPOT, CURRENT)` |
+
+- **edge** = 카드 표면(손에 닿는 체감) 온도. nvidia-smi/rocm-smi 기본 화면이 보여주는 값과 동일.
+- **junction** = 다이 국소 최고점(hotspot). 부하 시 edge 보다 30~50°C 높은 게 정상이며,
+  junction−edge 델타가 크면 다이-쿨러 접촉(TIM/마운트/에어플로) 열등 신호입니다.
+
+색상은 센서별로 다른 기준을 씁니다(junction 은 원래 높으므로 임계가 높음):
+
+| | edge | junction |
+|---|---|---|
+| 🟢 초록 | < 65°C | < 80°C |
+| 🟠 주황 | 65~74°C | 80~89°C |
+| 🔴 빨강 | ≥ 75°C | ≥ 90°C |
 
 ## Throttle
 
@@ -107,7 +120,7 @@ NVIDIA의 `nvmlDeviceGetUtilizationRates()`는 드라이버 내부 전역 공유
   ├─ 전력      gb_mon_power_mw()
   ├─ Util%     gb_mon_util_pct()    ← GPU별 독립 (NVIDIA 링버퍼 / AMD 직접)
   ├─ Clock     gb_mon_clock_mhz()   ← Peak% 계산에도 사용
-  ├─ 온도      gb_mon_temp_c()
+  ├─ 온도      gb_mon_temp2_c()    ← edge / junction 두 센서 동시
   └─ Throttle  gb_mon_throttle()
 
 GEMM 반복 (벤치 스레드, GPU 당 1개)
@@ -129,7 +142,7 @@ GEMM 반복 (벤치 스레드, GPU 당 1개)
 | TDP% | `전력 / TDP × 100` | 동일 |
 | Util% | `gb_mon_util_pct` (GPU별 독립) | 슬라이딩 윈도우 (최근 10초) |
 | Clock | `gb_mon_clock_mhz` | 슬라이딩 윈도우 (최근 10초) |
-| 온도 | `gb_mon_temp_c` | 현재값 (실시간) |
+| 온도(e/j) | `gb_mon_temp2_c` | 현재값 (실시간), `edge/junction°C` |
 | Throt | `gb_mon_throttle` | 현재값 |
 | VRAM | 초기화 시 할당 합산 | 고정값 |
 
@@ -145,7 +158,7 @@ GEMM 반복 (벤치 스레드, GPU 당 1개)
     ├ 평균 전력    : 595.3 W  (TDP 대비 99.2%)
     ├ GPU 사용률   : 99.6%
     ├ SM Clock     : 2710 MHz 평균  (종료 시 2715 MHz)
-    ├ 평균 온도    : 67.3°C  (종료 시 68°C)
+    ├ 평균 온도    : edge 55.1°C / junction 67.3°C  (종료 시 56 / 68°C)
     ├ Throttle    : 열 0.0초 (0.0%), 전력 0.0초 (0.0%)
     ├ 메모리 BW    : 1.247 TB/s (추정)
     └ 전력 효율    : 0.1451 TFLOPS/W

@@ -204,12 +204,19 @@ static inline int gb_mon_power_cap_range_mw(gb_mon_t *m,
     return 0;
 }
 
-static inline int gb_mon_temp_c(gb_mon_t *m)
+/* edge(GPU 표준 온도)·junction(hotspot) 동시 조회.
+   NVML 은 NVML_TEMPERATURE_GPU(=nvidia-smi 가 보여주는 GPU 온도)를 edge 로
+   제공한다. hotspot(junction)은 대부분(특히 소비자) GPU 에서 NVML 로 노출되지
+   않으므로 N/A(-1)로 둔다. (본체는 -1 이면 junction 을 표시하지 않는다.) */
+static inline int gb_mon_temp2_c(gb_mon_t *m, int *edge_c, int *hot_c)
 {
     unsigned int t = 0;
-    if (nvmlDeviceGetTemperature(m->dev, NVML_TEMPERATURE_GPU, &t) != NVML_SUCCESS)
-        return -1;
-    return (int)t;
+    int e = -1;
+    if (nvmlDeviceGetTemperature(m->dev, NVML_TEMPERATURE_GPU, &t) == NVML_SUCCESS)
+        e = (int)t;
+    if (edge_c) *edge_c = e;
+    if (hot_c)  *hot_c  = -1;   /* NVML junction 미노출 → N/A */
+    return (e >= 0) ? 0 : -1;
 }
 
 static inline unsigned gb_mon_clock_mhz(gb_mon_t *m)

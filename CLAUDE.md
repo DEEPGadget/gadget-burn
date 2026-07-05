@@ -86,9 +86,13 @@ make info                     # 바이너리에 포함된 GPU 코드 목록(NVID
   순서가 다를 수 있어, 안 맞추면 모니터링이 엉뚱한 GPU를 읽어 측정값이 전부 어긋난다.
 - **NVIDIA: NVML util 교차오염** — `nvmlDeviceGetUtilizationRates`는 멀티-GPU에서 같은 값을
   반환하는 버그가 있어 GPU별 독립 링버퍼 `GetSamples`로 우회.
-- **GPU 인덱스 정렬**: CUDA 기본 열거 순서(FASTEST_FIRST)는 혼합 GPU에서 nvidia-smi/NVML(PCI
-  순서)과 어긋나 `-g` 선택·모니터링이 다른 카드를 가리킨다. `gb_init_device_order()`가
-  main 최상단에서 `CUDA_DEVICE_ORDER=PCI_BUS_ID`를 강제(첫 CUDA 호출 전 필수). AMD는 no-op.
+- **GPU 인덱스 정렬**: 런타임 기본 열거 순서는 nvidia-smi/amd-smi(PCI-BDF 순서)와 어긋날 수
+  있어(NVIDIA=FASTEST_FIRST, HIP=BDF 오름차순 미보장 — RDNA4 2장에서 역순 관측) `-g` 선택·
+  라벨이 다른 카드를 가리킨다. 두 단계로 정렬한다: ① `gb_init_device_order()`가 NVIDIA에서
+  `CUDA_DEVICE_ORDER=PCI_BUS_ID`를 강제(첫 CUDA 호출 전 필수, AMD는 no-op), ②
+  `build_device_order()`가 전 디바이스를 BDF로 정렬해 **논리 인덱스↔물리 device id** 매핑을
+  만든다. 본체는 표시·`-g`에 `logical_id`(BDF 순), cudaSetDevice/모니터링에 `device_id`(물리)를
+  사용. 모니터링은 BDF 매칭이라 물리 id로 정상. (NVIDIA는 이미 BDF 순 → 매핑이 항등)
 - **백엔드별 기본 정밀도가 다름**: NVIDIA=`sgemm_tf32`(gpu-burn -tc 호환),
   AMD=`hgemm_mix`(Matrix Core 네이티브 고속 경로). TF32 미지원 HW는 FP32로 폴백.
 - **AMD throttle 비트는 보수적 매핑**(현재 0이 아니면 POWER_BRAKE). gfx별 정밀화는 TODO.

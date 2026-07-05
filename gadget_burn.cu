@@ -241,11 +241,21 @@ static const char *rpeak_color(double pct)
     return CLR_RED;
 }
 
-/* 온도: ≥75°C 빨강 / 65~74°C 노랑 / <65°C 초록 */
-static const char *temp_color(double t)
+/* edge(표면) 온도: ≥75°C 빨강 / 65~74°C 노랑 / <65°C 초록 */
+static const char *temp_color_edge(double t)
 {
     if (t >= 75.0) return CLR_RED;
     if (t >= 65.0) return CLR_YELLOW;
+    return CLR_GREEN;
+}
+
+/* junction(hotspot) 온도: 다이 국소 최고점. burn-in 수락검사에서는 보수적으로
+   80°C 부터 주의(노랑), 90°C 부터 위험(빨강)으로 경고한다.
+   ≥90 빨강 / 80~89 노랑 / <80 초록 */
+static const char *temp_color_junction(double t)
+{
+    if (t >= 90.0) return CLR_RED;
+    if (t >= 80.0) return CLR_YELLOW;
     return CLR_GREEN;
 }
 
@@ -356,7 +366,8 @@ typedef struct {
 /* GPU 당 컨텍스트 */
 typedef struct {
     /* 설정 */
-    int         device_id;
+    int         device_id;      /* 물리(런타임) device id — cudaSetDevice/모니터링용 */
+    int         logical_id;     /* 논리 인덱스 = BDF 오름차순(-g 입력·표시용) */
     int         gpu_index;
     char        name[96];       /* cudaDeviceProp.name 캐시 (CSV/메타용) */
     int         intensity;
@@ -382,17 +393,20 @@ typedef struct {
     /* 전체 누적 (최종 결과용) */
     double       sum_power;
     double       sum_util;
-    double       sum_temp;
+    double       sum_temp_edge;   /* edge(표면) 온도 누적 */
+    double       sum_temp_hot;    /* junction(hotspot) 온도 누적 (지원 GPU만) */
     double       sum_clock;
     long         mon_samples;
     long         util_samples;
+    long         temp_hot_samples;   /* junction 유효 샘플 수 (N/A GPU 는 0 유지) */
     long         throttle_thermal_samples;     /* SW/HW thermal slowdown 감지 횟수 */
     long         throttle_powerbrake_samples;  /* HW power brake 감지 횟수 */
 
     /* phase 경계 baseline 스냅샷 (per-phase 통계 = 현재 − baseline). plan(-S)용.
        리셋 대신 스냅샷이라 모니터/벤치 스레드와의 race 없이 phase별 평균 산출. */
-    double       base_sum_power, base_sum_util, base_sum_temp, base_sum_clock;
-    long         base_mon_samples, base_util_samples;
+    double       base_sum_power, base_sum_util, base_sum_clock;
+    double       base_sum_temp_edge, base_sum_temp_hot;
+    long         base_mon_samples, base_util_samples, base_temp_hot_samples;
     long         base_throttle_thermal, base_throttle_power;
     long         base_total_iters;
     double       base_total_gpu_ms;
@@ -405,7 +419,8 @@ typedef struct {
     int          win_head;
     int          win_count;
 
-    volatile unsigned int cur_temp;
+    volatile int          cur_temp_edge;   /* 현재 edge 온도(°C) */
+    volatile int          cur_temp_hot;    /* 현재 junction 온도(°C), -1=N/A */
     volatile unsigned int cur_util;
     volatile unsigned int cur_clock;
     volatile unsigned int cur_throttle;  /* GB_THROTTLE_* 비트마스크 (벤더 중립) */
@@ -609,8 +624,10 @@ static void *monitor_thread(void *arg)
     {
         double u = gb_mon_util_pct(&g->mon);
         g->cur_util  = (u >= 0.0) ? (unsigned int)u : 0;
-        int t = gb_mon_temp_c(&g->mon);
-        if (t >= 0) g->cur_temp = (unsigned int)t;
+        int te = -1, th = -1;
+        gb_mon_temp2_c(&g->mon, &te, &th);
+        if (te >= 0) g->cur_temp_edge = te;
+        g->cur_temp_hot = th;   /* -1 이면 N/A */
         unsigned int c = gb_mon_clock_mhz(&g->mon);
         if (c > 0) g->cur_clock = c;
     }
@@ -632,11 +649,13 @@ static void *monitor_thread(void *arg)
             g->util_samples++;
         }
 
-        /* 온도 */
-        int temp = gb_mon_temp_c(&g->mon);
-        if (temp >= 0) {
-            g->sum_temp += (double)temp;
-            g->cur_temp  = (unsigned int)temp;
+        /* 온도 (edge / junction 동시) */
+        int te = -1, th = -1;
+        if (gb_mon_temp2_c(&g->mon, &te, &th) == 0) {
+            if (te >= 0) { g->sum_temp_edge += (double)te; g->cur_temp_edge = te; }
+            if (th >= 0) { g->sum_temp_hot  += (double)th; g->cur_temp_hot  = th;
+                           g->temp_hot_samples++; }
+            else g->cur_temp_hot = -1;
         }
 
         /* SM/GFX Clock */
@@ -872,13 +891,13 @@ static void print_progress(int elapsed, int total,
            " TDP% ",                           /*  6열 */
            "Util% ",                           /*  6열 */
            " Clock ",                          /*  7열 */
-           "\xec\x98\xa8\xeb\x8f\x84 ",        /*  5열 "온도 " */
+           "\xec\x98\xa8\xeb\x8f\x84(e/j)",   /*  9열 "온도(e/j)" edge/junction */
            "Throt",                            /*  5열 */
            "  VRAM   ");                       /*  9열 */
 
     printf("  %s  %s  %s  %s  %s  %s  %s  %s  %s  %s\n",
            "------", "-------", "---------------",
-           "---------", "------", "------", "-------", "-----", "-----", "---------");
+           "---------", "------", "------", "-------", "---------", "-----", "---------");
 
     /* GPU 행 */
     for (int g = 0; g < num_gpus; g++) {
@@ -911,12 +930,28 @@ static void print_progress(int elapsed, int total,
         else
             snprintf(tdp_buf, sizeof(tdp_buf), "  N/A");
 
-        /* 온도: "°"는 UTF-8 2바이트, 표시 1열 → snprintf 후 %5s로 5열 확보 */
-        char temp_buf[16];
-        snprintf(temp_buf, sizeof(temp_buf), "%u\xc2\xb0\x43", gc->cur_temp);
+        /* 온도(edge/junction): 각각 색상, junction N/A(-1)면 '-'. "°"=UTF-8 2바이트
+           /1열. 색 코드가 섞여 %Ns 정렬 불가 → 가시 폭 계산 후 수동 패딩(9열). */
+        int e_t = gc->cur_temp_edge, h_t = gc->cur_temp_hot;
+        char e_num[8], h_num[8], temp_buf[64], temp_pad[16] = "";
+        snprintf(e_num, sizeof(e_num), "%d", e_t >= 0 ? e_t : 0);
+        const char *ec = temp_color_edge((double)(e_t >= 0 ? e_t : 0));
+        int vis;
+        if (h_t >= 0) {
+            snprintf(h_num, sizeof(h_num), "%d", h_t);
+            const char *hc = temp_color_junction((double)h_t);
+            snprintf(temp_buf, sizeof(temp_buf), "%s%s%s/%s%s%s\xc2\xb0\x43",
+                     ec, e_num, CLR_RESET, hc, h_num, CLR_RESET);
+            vis = (int)strlen(e_num) + 1 + (int)strlen(h_num) + 2;
+        } else {
+            snprintf(temp_buf, sizeof(temp_buf), "%s%s%s/-\xc2\xb0\x43",
+                     ec, e_num, CLR_RESET);
+            vis = (int)strlen(e_num) + 1 + 1 + 2;
+        }
+        { int pad = 9 - vis; if (pad < 0) pad = 0;
+          for (int pi = 0; pi < pad && pi < 15; pi++) temp_pad[pi] = ' '; }
 
         const char *rc = (rpeak > 0.0) ? rpeak_color(tflops / rpeak * 100.0) : "";
-        const char *tc = temp_color((double)gc->cur_temp);
 
         /* Throttle 표시 (5열): THERM (열) > PWR (전력 brake) > "  -  " (없음)
            우선순위는 thermal > power brake. SW Power Cap은 의도된 상태라 표시 안 함.
@@ -935,15 +970,15 @@ static void print_progress(int elapsed, int total,
             throt_color = "";
         }
 
-        printf("  GPU %2d  %7.3f  %s%13s%s  %7.1f W  %6s  %5.1f%%  %4uMHz  %s%5s%s  %s%s%s  %5zu MiB\n",
-               gc->device_id,
+        printf("  GPU %2d  %7.3f  %s%13s%s  %7.1f W  %6s  %5.1f%%  %4uMHz  %s%s  %s%s%s  %5zu MiB\n",
+               gc->logical_id,
                tflops,
                rc, peak_buf, CLR_RESET,
                pw,
                tdp_buf,
                util,
                clk,
-               tc, temp_buf, CLR_RESET,
+               temp_buf, temp_pad,
                throt_color, throt_str, CLR_RESET,
                gc->vram_used_mb);
     }
@@ -958,7 +993,8 @@ static void print_progress(int elapsed, int total,
    ───────────────────────────────────────────────────────── */
 typedef struct {
     double tflops, rpeak;
-    double avg_pw, avg_util, avg_temp, avg_clk;
+    double avg_pw, avg_util, avg_temp_edge, avg_temp_hot, avg_clk;
+    int    has_hot;   /* junction 평균 유효 여부 (N/A GPU 는 0) */
     double membw, eff;
     double th_sec, pwr_sec, th_pct, pwr_pct;
     long   iters;
@@ -975,7 +1011,9 @@ static PhaseStat phase_stat(const GpuCtx *gc, PrecType prec, size_t bpe)
     long   d_util = gc->util_samples - gc->base_util_samples;
     double d_pw   = gc->sum_power - gc->base_sum_power;
     double d_ut   = gc->sum_util  - gc->base_sum_util;
-    double d_tp   = gc->sum_temp  - gc->base_sum_temp;
+    double d_tpe  = gc->sum_temp_edge - gc->base_sum_temp_edge;
+    double d_tph  = gc->sum_temp_hot  - gc->base_sum_temp_hot;
+    long   d_hot  = gc->temp_hot_samples - gc->base_temp_hot_samples;
     double d_ck   = gc->sum_clock - gc->base_sum_clock;
     long   d_iter = gc->total_iters  - gc->base_total_iters;
     double d_ms   = gc->total_gpu_ms - gc->base_total_gpu_ms;
@@ -987,7 +1025,9 @@ static PhaseStat phase_stat(const GpuCtx *gc, PrecType prec, size_t bpe)
     s.wall_s = d_ms * 1e-3;
     s.avg_pw   = (d_mon  > 0) ? d_pw / d_mon  : 0.0;
     s.avg_util = (d_util > 0) ? d_ut / d_util : 0.0;
-    s.avg_temp = (d_mon  > 0) ? d_tp / d_mon  : 0.0;
+    s.avg_temp_edge = (d_mon  > 0) ? d_tpe / d_mon  : 0.0;
+    s.avg_temp_hot  = (d_hot  > 0) ? d_tph / d_hot  : 0.0;
+    s.has_hot  = (d_hot > 0);
     s.avg_clk  = (d_mon  > 0) ? d_ck / d_mon  : 0.0;
     s.tflops   = (d_ms > 0)
         ? 2.0 * gc->mat_size * (double)gc->mat_size * gc->mat_size * gc->intensity
@@ -1011,7 +1051,9 @@ static void snapshot_baseline(GpuCtx *gc)
 {
     gc->base_sum_power = gc->sum_power;
     gc->base_sum_util  = gc->sum_util;
-    gc->base_sum_temp  = gc->sum_temp;
+    gc->base_sum_temp_edge = gc->sum_temp_edge;
+    gc->base_sum_temp_hot  = gc->sum_temp_hot;
+    gc->base_temp_hot_samples = gc->temp_hot_samples;
     gc->base_sum_clock = gc->sum_clock;
     gc->base_mon_samples      = gc->mon_samples;
     gc->base_util_samples     = gc->util_samples;
@@ -1142,7 +1184,7 @@ static void csv_write_meta(FILE *f, const Config *cfg, const char *path,
         char bdf[32] = "?";
         cudaDeviceGetPCIBusId(bdf, (int)sizeof(bdf), gc->device_id);
         fprintf(f, "# gpu%-2d      : id=%d \"%s\" bdf=%s",
-                g, gc->device_id, gc->name, bdf);
+                g, gc->logical_id, gc->name, bdf);
         if (gc->tdp_mw > 0) fprintf(f, " tdp=%uW", gc->tdp_mw / 1000);
         if (gc->core_info.cores_fp32 > 0)
             fprintf(f, " fp32=%d fp64=%d tensor=%d",
@@ -1153,7 +1195,8 @@ static void csv_write_meta(FILE *f, const Config *cfg, const char *path,
 
     fprintf(f, "timestamp,elapsed_sec,phase_idx,phase_tdp_w,phase_elapsed_sec,"
                "gpu_id,gpu_name,tflops,peak_pct,rpeak_tflops,"
-               "power_w,tdp_pct,util_pct,clock_mhz,temp_c,throttle,vram_mib\n");
+               "power_w,tdp_pct,util_pct,clock_mhz,temp_edge_c,temp_junction_c,"
+               "throttle,vram_mib\n");
 }
 
 /* 한 GPU의 현재(슬라이딩 윈도우) 값을 한 행으로 기록.
@@ -1187,11 +1230,16 @@ static void csv_write_row(FILE *f, const char *ts, int elapsed,
     if (phase_tdp_w > 0) snprintf(ptdp_s, sizeof(ptdp_s), "%d", phase_tdp_w);
     else ptdp_s[0] = '\0';
 
-    fprintf(f, "%s,%d,%d,%s,%d,%d,\"%s\",%.3f,%s,%s,%.1f,%s,%.1f,%u,%u,%s,%zu\n",
+    /* junction N/A(-1)면 CSV 는 빈 칸 → pandas/gnuplot 에서 NaN 처리 */
+    char hot_s[12];
+    if (gc->cur_temp_hot >= 0) snprintf(hot_s, sizeof(hot_s), "%d", gc->cur_temp_hot);
+    else hot_s[0] = '\0';
+
+    fprintf(f, "%s,%d,%d,%s,%d,%d,\"%s\",%.3f,%s,%s,%.1f,%s,%.1f,%u,%d,%s,%s,%zu\n",
             ts, elapsed, phase_idx, ptdp_s, phase_elapsed,
-            gc->device_id, gc->name,
+            gc->logical_id, gc->name,
             tflops, peak_s, rpeak_s, pw, tdp_s, util, clk,
-            (unsigned)gc->cur_temp, throt, gc->vram_used_mb);
+            gc->cur_temp_edge, hot_s, throt, gc->vram_used_mb);
 }
 
 /* 파일 끝에 '#' 주석으로 phase별 per-GPU 평균 요약 기록 (phase 종료 시마다) */
@@ -1207,11 +1255,14 @@ static void csv_write_phase_summary(FILE *f, int ph, const Phase *P,
                 ph, P->duration_s);
     for (int g = 0; g < num_gpus; g++) {
         const PhaseStat *s = &ps[g];
+        char hot_avg[16];
+        if (s->has_hot) snprintf(hot_avg, sizeof(hot_avg), "%.1f", s->avg_temp_hot);
+        else hot_avg[0] = '\0';
         fprintf(f, "# gpu%-2d      : avg_tflops=%.3f avg_power_w=%.1f avg_util=%.1f "
-                   "avg_clock_mhz=%.0f avg_temp_c=%.1f throttle_thermal_s=%.1f "
-                   "throttle_power_s=%.1f total_iters=%ld\n",
-                g, s->tflops, s->avg_pw, s->avg_util, s->avg_clk, s->avg_temp,
-                s->th_sec, s->pwr_sec, s->iters);
+                   "avg_clock_mhz=%.0f avg_temp_edge_c=%.1f avg_temp_junction_c=%s "
+                   "throttle_thermal_s=%.1f throttle_power_s=%.1f total_iters=%ld\n",
+                g, s->tflops, s->avg_pw, s->avg_util, s->avg_clk,
+                s->avg_temp_edge, hot_avg, s->th_sec, s->pwr_sec, s->iters);
     }
 }
 
@@ -1237,7 +1288,7 @@ static void print_phase_results(int ph, int num_phases, int plan_mode,
         const GpuCtx    *gc = &gpus[g];
         const PhaseStat *s  = &ps[g];
 
-        printf("  GPU %2d  %s\n", gc->device_id, gc->name);
+        printf("  GPU %2d  %s\n", gc->logical_id, gc->name);
         printf("    ├ 행렬 크기    : %d x %d,  스트림 %d\n",
                gc->mat_size, gc->mat_size, gc->intensity);
         printf("    ├ 총 반복 횟수 : %ld 회\n", s->iters);
@@ -1260,8 +1311,17 @@ static void print_phase_results(int ph, int num_phases, int plan_mode,
         printf("    ├ GPU 사용률   : %s%.1f %%%s\n", CLR_CYAN, s->avg_util, CLR_RESET);
         printf("    ├ SM Clock     : %.0f MHz 평균  (종료 시 %u MHz)\n",
                s->avg_clk, gc->cur_clock);
-        printf("    ├ 평균 온도    : %s%.1f°C%s  (종료 시 %u°C)\n",
-               temp_color(s->avg_temp), s->avg_temp, CLR_RESET, gc->cur_temp);
+        if (s->has_hot)
+            printf("    ├ 평균 온도    : edge %s%.1f°C%s / junction %s%.1f°C%s"
+                   "  (종료 시 %d / %d°C)\n",
+                   temp_color_edge(s->avg_temp_edge), s->avg_temp_edge, CLR_RESET,
+                   temp_color_junction(s->avg_temp_hot), s->avg_temp_hot, CLR_RESET,
+                   gc->cur_temp_edge, gc->cur_temp_hot);
+        else
+            printf("    ├ 평균 온도    : edge %s%.1f°C%s / junction N/A"
+                   "  (종료 시 %d°C)\n",
+                   temp_color_edge(s->avg_temp_edge), s->avg_temp_edge, CLR_RESET,
+                   gc->cur_temp_edge);
 
         if (s->mon_samples > 0) {
             const char *th_col  = (s->th_sec  > 0.0) ? CLR_RED    : "";
@@ -1452,6 +1512,60 @@ static void print_usage(const char *prog)
     printf("  sudo %s -S 300:10m,400:10m,600:10m -o   # TDP 스윕 + CSV 기록\n\n", prog);
 }
 
+/* ─────────────────────────────────────────────────────────
+   디바이스 열거 순서 정렬 (BDF 오름차순 = nvidia-smi/amd-smi 와 동일)
+   ─────────────────────────────────────────────────────────
+   HIP 는 디바이스를 PCI-BDF 오름차순으로 열거한다는 보장이 없다(예: RDNA4
+   2장 시스템에서 역순으로 관측). 그러면 도구의 index 와 amd-smi/rocm-smi 의
+   index 가 어긋나 -g 선택·라벨이 엉뚱한 카드를 가리킨다. NVIDIA 는
+   gb_init_device_order 가 CUDA_DEVICE_ORDER=PCI_BUS_ID 를 걸어 이미 BDF 순이라
+   이 매핑이 항등(identity)이 된다.
+     g_dev_order[논리 인덱스] = 물리(런타임) device id
+   본체는 사용자 표시·-g 입력을 "논리 인덱스"로, cudaSetDevice/모니터링은
+   "물리 device id"로 사용한다. (모니터링은 BDF 매칭이라 물리 id로 정상 동작) */
+static int g_dev_order[MAX_GPUS];
+static int g_dev_order_n = 0;
+
+static unsigned long long bdf_key(int dev)
+{
+    char s[32] = "";
+    if (cudaDeviceGetPCIBusId(s, (int)sizeof(s), dev) != cudaSuccess)
+        return ~0ULL;   /* 조회 실패는 맨 뒤로 */
+    unsigned dom = 0, bus = 0, d = 0, f = 0;
+    sscanf(s, "%x:%x:%x.%x", &dom, &bus, &d, &f);
+    return ((unsigned long long)dom << 24) | ((unsigned long long)bus << 16)
+           | ((unsigned long long)d << 8) | (unsigned long long)f;
+}
+
+/* 전 디바이스를 BDF 오름차순으로 정렬해 논리→물리 매핑을 구성. main 최상단,
+   첫 CUDA 호출 시점(=NVIDIA 는 env 적용 이후)에 1회 호출. */
+static void build_device_order(void)
+{
+    int n = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&n));
+    if (n > MAX_GPUS) n = MAX_GPUS;
+    unsigned long long key[MAX_GPUS];
+    for (int i = 0; i < n; i++) { g_dev_order[i] = i; key[i] = bdf_key(i); }
+    for (int i = 1; i < n; i++) {          /* 삽입정렬 (n 작음) */
+        int cur = g_dev_order[i];
+        unsigned long long k = key[cur];
+        int j = i - 1;
+        while (j >= 0 && key[g_dev_order[j]] > k) {
+            g_dev_order[j + 1] = g_dev_order[j];
+            j--;
+        }
+        g_dev_order[j + 1] = cur;
+    }
+    g_dev_order_n = n;
+}
+
+/* 논리 인덱스 → 물리 device id (미구성/범위 밖이면 항등) */
+static int phys_of(int logical)
+{
+    if (logical < 0 || logical >= g_dev_order_n) return logical;
+    return g_dev_order[logical];
+}
+
 static void print_gpu_list(void)
 {
     int n = 0;
@@ -1463,16 +1577,17 @@ static void print_gpu_list(void)
     printf("  ID  이름                          VRAM        TDP    PCI(BDF)\n");
     printf("──────────────────────────────────────────────────────────────────────\n");
 
-    for (int i = 0; i < n; i++) {
+    for (int L = 0; L < n; L++) {
+        int phys = phys_of(L);           /* 논리 L → 물리 device id */
         cudaDeviceProp p;
-        CUDA_CHECK(cudaGetDeviceProperties(&p, i));
+        CUDA_CHECK(cudaGetDeviceProperties(&p, phys));
         unsigned int tdp_mw = 0;
         gb_mon_t mon;
-        if (gb_mon_open(i, &mon) == 0)
+        if (gb_mon_open(phys, &mon) == 0)
             tdp_mw = gb_mon_tdp_mw(&mon);
         char bdf[32] = "?";
-        cudaDeviceGetPCIBusId(bdf, (int)sizeof(bdf), i);
-        printf("  [%d]  %-28s  %5zu MiB", i, p.name,
+        cudaDeviceGetPCIBusId(bdf, (int)sizeof(bdf), phys);
+        printf("  [%d]  %-28s  %5zu MiB", L, p.name,
                p.totalGlobalMem / (1024 * 1024));
         if (tdp_mw > 0) printf("  %4u W", tdp_mw / 1000);
         else            printf("        ");   /* TDP 자리 맞춤 (8칸) */
@@ -1521,7 +1636,7 @@ static void on_terminate_signal(int signo)
 static int apply_power_cap(GpuCtx *gc, int watts, const char *ind)
 {
     if (!gc->mon.valid || gc->orig_cap_mw == 0) {
-        fprintf(stderr, "\n오류: GPU %d 전력 캡을 읽을 수 없어 적용 불가\n", gc->device_id);
+        fprintf(stderr, "\n오류: GPU %d 전력 캡을 읽을 수 없어 적용 불가\n", gc->logical_id);
         return -1;
     }
     unsigned req_mw = (unsigned)watts * 1000u;
@@ -1529,23 +1644,23 @@ static int apply_power_cap(GpuCtx *gc, int watts, const char *ind)
     if (gb_mon_power_cap_range_mw(&gc->mon, &cmin, &cmax) == 0 && cmax > 0) {
         if (req_mw < cmin) {
             printf("%s%s[TDP] GPU %d 요청 %dW < 최소 %uW → %uW로 클램프%s\n",
-                   ind, CLR_WARN, gc->device_id, watts, cmin / 1000, cmin / 1000, CLR_RESET);
+                   ind, CLR_WARN, gc->logical_id, watts, cmin / 1000, cmin / 1000, CLR_RESET);
             req_mw = cmin;
         } else if (req_mw > cmax) {
             printf("%s%s[TDP] GPU %d 요청 %dW > 최대 %uW → %uW로 클램프%s\n",
-                   ind, CLR_WARN, gc->device_id, watts, cmax / 1000, cmax / 1000, CLR_RESET);
+                   ind, CLR_WARN, gc->logical_id, watts, cmax / 1000, cmax / 1000, CLR_RESET);
             req_mw = cmax;
         }
     }
     if (gb_mon_set_power_cap_mw(&gc->mon, req_mw) != 0) {
         fprintf(stderr, "\n오류: GPU %d 전력 캡 설정 실패 — "
-                "root 권한이 필요하거나 미지원 GPU입니다.\n", gc->device_id);
+                "root 권한이 필요하거나 미지원 GPU입니다.\n", gc->logical_id);
         return -1;
     }
     gc->cap_applied = 1;
     gc->tdp_mw      = req_mw;
     printf("%s%s[TDP] GPU %d 전력 캡 적용: %uW (원래 %uW)%s\n",
-           ind, CLR_CYAN, gc->device_id, req_mw / 1000, gc->orig_cap_mw / 1000, CLR_RESET);
+           ind, CLR_CYAN, gc->logical_id, req_mw / 1000, gc->orig_cap_mw / 1000, CLR_RESET);
     return 0;
 }
 
@@ -1624,6 +1739,11 @@ int main(int argc, char **argv)
         default:  print_usage(argv[0]); return 1;
         }
     }
+
+    /* 디바이스 열거 순서(논리 인덱스)를 BDF 오름차순으로 구성. 첫 CUDA 호출
+       시점이며, NVIDIA 는 위 gb_init_device_order 의 env 가 이미 적용된 뒤다.
+       print_gpu_list / -g 선택 모두 이 매핑을 사용한다. */
+    build_device_order();
 
     /* list_only 는 print_gpu_list 가 자체적으로 모니터링 라이브러리를
        init/shutdown 하므로 여기서 따로 init 하지 않습니다. */
@@ -1725,7 +1845,8 @@ int main(int argc, char **argv)
 
     for (int g = 0; g < cfg.num_gpus; g++) {
         GpuCtx *gc = &gpus[g];
-        gc->device_id = cfg.gpu_ids[g];
+        gc->logical_id = cfg.gpu_ids[g];              /* 사용자 표시·-g 입력 (BDF 순) */
+        gc->device_id  = phys_of(cfg.gpu_ids[g]);     /* 실제 런타임 device id */
         gc->gpu_index = g;
         gc->intensity = cfg.intensity;
         gc->prec      = cfg.prec;
@@ -1762,7 +1883,7 @@ int main(int argc, char **argv)
 
         char bdf[32] = "?";
         cudaDeviceGetPCIBusId(bdf, (int)sizeof(bdf), gc->device_id);
-        printf("  [초기화] GPU %d: %s  [%s]", gc->device_id, prop.name, bdf);
+        printf("  [초기화] GPU %d: %s  [%s]", gc->logical_id, prop.name, bdf);
         if (gc->tdp_mw > 0) printf("  TDP %u W", gc->tdp_mw / 1000);
         printf("\n");
 

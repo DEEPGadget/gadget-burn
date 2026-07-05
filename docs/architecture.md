@@ -43,7 +43,7 @@ void     gb_mon_shutdown(void);
 int      gb_mon_open(int dev_id, gb_mon_t *out);
 unsigned gb_mon_power_mw (gb_mon_t *);
 unsigned gb_mon_tdp_mw   (gb_mon_t *);
-int      gb_mon_temp_c   (gb_mon_t *);   // 실패 -1
+int      gb_mon_temp2_c  (gb_mon_t *, int *edge_c, int *hot_c);  // 실패 -1, hot=-1 이면 N/A
 unsigned gb_mon_clock_mhz(gb_mon_t *);   // 실패 0
 double   gb_mon_util_pct (gb_mon_t *);   // 실패 -1
 unsigned gb_mon_throttle (gb_mon_t *);   // GB_THROTTLE_* 비트마스크

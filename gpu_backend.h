@@ -123,7 +123,10 @@ typedef enum {
      int      gb_mon_open(int dev_id, gb_mon_t *out);  // 0=성공
      unsigned gb_mon_power_mw   (gb_mon_t);       // 전력 (mW 로 통일)
      unsigned gb_mon_tdp_mw     (gb_mon_t);       // power cap / TDP (mW)
-     int      gb_mon_temp_c     (gb_mon_t);       // 코어/hotspot 온도 (°C), 실패 -1
+     int      gb_mon_temp2_c    (gb_mon_t, int *edge_c, int *hot_c);
+            // edge(표면)/junction(hotspot) 온도(°C)를 동시 조회. 0=성공(edge 유효).
+            // *hot_c = -1 이면 해당 GPU 가 junction 센서를 노출하지 않음(N/A).
+            // AMD: EDGE / HOTSPOT. NVIDIA: NVML_TEMPERATURE_GPU / (대개 N/A).
      unsigned gb_mon_clock_mhz  (gb_mon_t);       // SM/GFX clock (MHz), 실패 0
      double   gb_mon_util_pct   (gb_mon_t);       // GPU 사용률 (%), 실패 -1
      unsigned gb_mon_throttle   (gb_mon_t);       // GB_THROTTLE_* 비트마스크
