@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include <hip/hip_bf16.h>
 #include <rocblas/rocblas.h>
 #include <amd_smi/amdsmi.h>
 
@@ -70,6 +71,9 @@
    ───────────────────────────────────────────────────────── */
 typedef __half gb_half;
 static inline gb_half gb_float2half(float f) { return __float2half(f); }
+
+/* GPU bfloat16 타입 (BF16 in / FP32 acc 경로용). HIP 는 __hip_bfloat16 제공. */
+typedef __hip_bfloat16 gb_bfloat16;
 
 typedef hipStream_t gb_stream_t;
 
@@ -167,6 +171,17 @@ static inline int gb_gemm(gb_blas_handle_t h, gb_prec_t prec,
                 B, rocblas_datatype_f16_r, K, &beta,
                 C, rocblas_datatype_f16_r, M,
                 C, rocblas_datatype_f16_r, M,
+                rocblas_datatype_f32_r, algo, sol, flags);
+        break;
+    }
+    case GB_PREC_BF16: {
+        /* BF16 in / FP32 acc — alpha,beta 는 compute_type(FP32) 기준 */
+        const float alpha = 1.f, beta = 0.f;
+        st = rocblas_gemm_ex(h, opN, opN, M, N, K, &alpha,
+                A, rocblas_datatype_bf16_r, M,
+                B, rocblas_datatype_bf16_r, K, &beta,
+                C, rocblas_datatype_bf16_r, M,
+                C, rocblas_datatype_bf16_r, M,
                 rocblas_datatype_f32_r, algo, sol, flags);
         break;
     }

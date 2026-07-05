@@ -14,6 +14,7 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <nvml.h>
 
 /* NVIDIA GPU 코어 DB (동적 Rpeak 계산용 GB_NVIDIA_CORE_ENTRIES 매크로 제공).
@@ -25,6 +26,9 @@
    ───────────────────────────────────────────────────────── */
 typedef __half gb_half;
 static inline gb_half gb_float2half(float f) { return __float2half(f); }
+
+/* GPU bfloat16 타입 (BF16 in / FP32 acc 경로용). CUDA 는 __nv_bfloat16 제공. */
+typedef __nv_bfloat16 gb_bfloat16;
 
 /* ─────────────────────────────────────────────────────────
    Runtime 타입 별칭 (본체가 gb_stream_t 등으로 참조)
@@ -129,6 +133,15 @@ static inline int gb_gemm(gb_blas_handle_t h, gb_prec_t prec,
                           &alpha, A, CUDA_R_16F, M,
                                   B, CUDA_R_16F, K,
                           &beta,  C, CUDA_R_16F, M,
+                          CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        break;
+    }
+    case GB_PREC_BF16: {
+        const float alpha = 1.f, beta = 0.f;   /* BF16 in, FP32 acc */
+        st = cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, M, N, K,
+                          &alpha, A, CUDA_R_16BF, M,
+                                  B, CUDA_R_16BF, K,
+                          &beta,  C, CUDA_R_16BF, M,
                           CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
         break;
     }

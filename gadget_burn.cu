@@ -13,7 +13,7 @@
  *
  *   -t <초>       총 측정 시간                       (기본: 3600)
  *   -i <강도>     GPU 당 동시 GEMM 스트림 수         (기본: 1)
- *   -p <타입>     sgemm | dgemm | hgemm | hgemm_mix | sgemm_tf32  (기본: sgemm_tf32)
+ *   -p <타입>     sgemm | dgemm | hgemm | hgemm_mix | bf16 | sgemm_tf32  (기본: sgemm_tf32)
  *                 hgemm      → FP16 in / FP16 acc Tensor Core (피크 TFLOPS 최대)
  *                 hgemm_mix  → FP16 in / FP32 acc Tensor Core (mixed precision)
  *                 sgemm_tf32 → FP32 storage + TF32 Tensor Core (기본, gpu-burn -tc 호환)
@@ -124,6 +124,21 @@ extern "C" __global__ void init_random_f16(__half *buf, size_t n, unsigned seed)
         /* FP16 max ~65504. K=8192 accumulation 시 overflow 방지 위해 [0, 2.0) 사용 */
         float val = (float)s * (2.0f / 4294967296.0f);
         buf[tid] = __float2half(val);
+    }
+}
+
+extern "C" __global__ void init_random_bf16(gb_bfloat16 *buf, size_t n, unsigned seed)
+{
+    size_t stride = (size_t)blockDim.x * gridDim.x;
+    for (size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         tid < n; tid += stride) {
+        unsigned int s = (unsigned int)(tid * 2654435761u) ^ seed;
+        s = xorshift32(s);
+        s = xorshift32(s);
+        /* BF16 은 지수부 8bit(FP32급 범위)지만, FP16 과 동일하게 [0, 2.0) 로
+           두어 누산 크기를 맞춘다. */
+        float val = (float)s * (2.0f / 4294967296.0f);
+        buf[tid] = __float2bfloat16(val);
     }
 }
 
@@ -282,6 +297,7 @@ typedef gb_prec_t PrecType;
 #define PREC_HGEMM       GB_PREC_HGEMM
 #define PREC_HGEMM_MIX   GB_PREC_HGEMM_MIX
 #define PREC_SGEMM_TF32  GB_PREC_SGEMM_TF32
+#define PREC_BF16        GB_PREC_BF16
 
 /* random init dispatch helper (PrecType 정의 후) */
 static void init_buffer_random(void *buf, size_t n_elem, PrecType prec,
@@ -298,6 +314,10 @@ static void init_buffer_random(void *buf, size_t n_elem, PrecType prec,
         case PREC_HGEMM_MIX:
             init_random_f16<<<blocks, threads, 0, stream>>>(
                 (__half *)buf, n_elem, seed);
+            break;
+        case PREC_BF16:
+            init_random_bf16<<<blocks, threads, 0, stream>>>(
+                (gb_bfloat16 *)buf, n_elem, seed);
             break;
         default:
             init_random_f32<<<blocks, threads, 0, stream>>>(
@@ -462,7 +482,8 @@ static int calc_c_buffers(int device_id, MemSpec spec,
     switch (prec) {
         case PREC_DGEMM:     bpe = 8; break;
         case PREC_HGEMM:
-        case PREC_HGEMM_MIX: bpe = 2; break;
+        case PREC_HGEMM_MIX:
+        case PREC_BF16:      bpe = 2; break;
         default:             bpe = 4; break;
     }
 
@@ -508,7 +529,8 @@ static void worker_init(GemmWorker *w, int device_id,
     switch (prec) {
         case PREC_DGEMM:     bpe = sizeof(double); break;
         case PREC_HGEMM:
-        case PREC_HGEMM_MIX: bpe = sizeof(__half);  break;
+        case PREC_HGEMM_MIX:
+        case PREC_BF16:      bpe = sizeof(gb_bfloat16); break;
         default:             bpe = sizeof(float);   break;
     }
 
@@ -544,7 +566,8 @@ static size_t worker_vram_bytes(const GemmWorker *w)
     switch (w->prec) {
         case PREC_DGEMM:     bpe = 8; break;
         case PREC_HGEMM:
-        case PREC_HGEMM_MIX: bpe = 2; break;
+        case PREC_HGEMM_MIX:
+        case PREC_BF16:      bpe = 2; break;
         default:             bpe = 4; break;
     }
     /* A + B + (C × num_c_buffers) */
@@ -577,7 +600,8 @@ static void *current_c_ptr(const GemmWorker *w)
     switch (w->prec) {
         case PREC_DGEMM:     bpe = sizeof(double); break;
         case PREC_HGEMM:
-        case PREC_HGEMM_MIX: bpe = sizeof(__half);  break;
+        case PREC_HGEMM_MIX:
+        case PREC_BF16:      bpe = sizeof(gb_bfloat16); break;
         default:             bpe = sizeof(float);   break;
     }
     size_t one = bpe * (size_t)w->M * (size_t)w->N;
@@ -824,6 +848,8 @@ static double calc_dynamic_rpeak(const GpuCtx *gc, PrecType prec, double clock_m
             return gc->core_info.cores_tensor
                    * (double)gc->core_info.tc_ops * clock_mhz * 1e-6;
         case PREC_HGEMM_MIX:
+        case PREC_BF16:
+            /* BF16 은 대부분 HW 에서 FP16(mix) 과 동일 matrix 처리율 */
             return gc->core_info.cores_tensor
                    * (double)gc->core_info.tc_ops_mix * clock_mhz * 1e-6;
         case PREC_SGEMM_TF32:
@@ -1078,6 +1104,7 @@ static const char *prec_label(PrecType p)
     case PREC_DGEMM:      return "DGEMM (FP64)";
     case PREC_HGEMM:      return "HGEMM (FP16 in / FP16 acc)";
     case PREC_HGEMM_MIX:  return "HGEMM_MIX (FP16 in / FP32 acc)";
+    case PREC_BF16:       return "BF16 (BF16 in / FP32 acc)";
     case PREC_SGEMM_TF32: return "SGEMM_TF32 (FP32 storage / TF32 compute)";
     case PREC_SGEMM:
     default:              return "SGEMM (FP32)";
@@ -1448,12 +1475,14 @@ static void print_usage(const char *prog)
     printf("\n사용법: %s [옵션]\n\n", prog);
     printf("  -t <초>      총 측정 시간                          (기본: 3600)\n");
     printf("  -i <강도>    GPU 당 동시 GEMM 스트림 수            (기본: 1)\n");
-    printf("  -p <타입>    sgemm | dgemm | hgemm | hgemm_mix | sgemm_tf32   (기본: %s)\n",
+    printf("  -p <타입>    sgemm | dgemm | hgemm | hgemm_mix | bf16 | sgemm_tf32   (기본: %s)\n",
            GB_DEFAULT_PREC_NAME);
     printf("               sgemm      → FP32 (cublasGemmEx, COMPUTE_32F)\n");
     printf("               dgemm      → FP64 (cublasGemmEx, COMPUTE_64F)\n");
     printf("               hgemm      → FP16 in / FP16 acc Tensor Core\n");
     printf("                            이론 피크 TFLOPS가 가장 높음\n");
+    printf("               bf16       → BF16 in / FP32 acc Tensor/Matrix Core\n");
+    printf("                            FP16(mix)과 동일 처리율, 넓은 지수부(FP32급 범위)\n");
 #if defined(GB_BACKEND_AMD)
     printf("               hgemm_mix  → FP16 in / FP32 acc Matrix Core (mixed precision) [기본]\n");
     printf("                            AMD Matrix Core(WMMA/MFMA)의 네이티브 고속 경로,\n");
@@ -1705,6 +1734,7 @@ int main(int argc, char **argv)
             if      (!strcmp(optarg, "dgemm"))      cfg.prec = PREC_DGEMM;
             else if (!strcmp(optarg, "hgemm_mix"))  cfg.prec = PREC_HGEMM_MIX;
             else if (!strcmp(optarg, "hgemm"))      cfg.prec = PREC_HGEMM;
+            else if (!strcmp(optarg, "bf16"))       cfg.prec = PREC_BF16;
             else if (!strcmp(optarg, "sgemm_tf32")) cfg.prec = PREC_SGEMM_TF32;
             else if (!strcmp(optarg, "sgemm"))      cfg.prec = PREC_SGEMM;
             else                                    cfg.prec = GB_DEFAULT_PREC;
@@ -1793,7 +1823,8 @@ int main(int argc, char **argv)
         "DGEMM (FP64)",
         "HGEMM (FP16 in / FP16 acc, Tensor Core)",
         "HGEMM_MIX (FP16 in / FP32 acc, Tensor Core, mixed precision)",
-        "SGEMM_TF32 (FP32 storage, TF32 Tensor Core compute)"
+        "SGEMM_TF32 (FP32 storage, TF32 Tensor Core compute)",
+        "BF16 (BF16 in / FP32 acc, Tensor/Matrix Core)"
     };
 
     /* ── 실행 설정 헤더 출력 ── */
@@ -1969,7 +2000,8 @@ int main(int argc, char **argv)
     switch (cfg.prec) {
         case PREC_DGEMM:     bpe = 8; break;
         case PREC_HGEMM:
-        case PREC_HGEMM_MIX: bpe = 2; break;
+        case PREC_HGEMM_MIX:
+        case PREC_BF16:      bpe = 2; break;
         default:             bpe = 4; break;
     }
 
