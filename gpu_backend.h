@@ -124,6 +124,12 @@ typedef enum {
                     const void *A, const void *B, void *C);
             // 반환 0 = 성공. A,B,C 는 column-major, lda=M, ldb=K, ldc=M,
             // alpha=1 beta=0, op=N/N 고정 (본체 run_gemm 의미와 일치).
+     double gb_gemm_autotune(gb_blas_handle_t h, gb_prec_t prec,
+                    int M, int N, int K,
+                    const void *A, const void *B, void *C);
+            // 실측 기반 최적 solution/algo 를 골라 핸들에 캐시(이후 gb_gemm 이 사용).
+            // worker 초기화 시 1회 호출(-A 로 비활성). 반환: 최고 TFLOPS(참고, 미튜닝 0).
+            // AMD: rocBLAS get_solutions 전 타입 + hipBLASLt(fp8). NVIDIA: cuBLASLt(fp8)만.
 
    [모니터링]
      int      gb_mon_init(void);                 // 라이브러리 init (1회)

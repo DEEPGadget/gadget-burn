@@ -32,6 +32,29 @@ gadget_burn은 정밀도(`-p`)에 따라 다른 GEMM을 실행하고, 각 GPU의
   크게 못 미칩니다(Peak% 낮음, 정직 반영). 또한 `fp8`(e4m3 출력)은 **N=8192·16384 에서 커널
   갭으로 저성능** — 다른 크기(`-X 4096` 등)나 `fp8_mix` 권장. NVIDIA fp8 은 실기 미검증입니다.
 
+## Autotune (기본 켜짐, `-A` 로 끔)
+
+BLAS 라이브러리의 **기본 커널 선택이 실측 최적이 아닌 경우**가 많습니다(특히 gfx1201).
+초기화 시 후보 solution/algo 를 **실제로 벤치**해 가장 빠른 것을 골라 캐시합니다.
+
+| 경로 | 열거 방법 |
+|---|---|
+| AMD rocBLAS (sgemm/hgemm/hgemm_mix/bf16/dgemm/tf32) | `rocblas_gemm_ex_get_solutions` → `solution_index` |
+| AMD hipBLASLt / NVIDIA cuBLASLt (fp8) | `*MatmulAlgoGetHeuristic` 리스트 |
+| NVIDIA cublasGemmEx (classic) | no-op (cuBLAS 내부 자동선택이 이미 양호) |
+
+RX 9070 XT(gfx1201) 실측 효과 (autotune ON vs OFF):
+
+| `-p` | 기본(OFF) | autotune(ON) | 이득 |
+|---|---|---|---|
+| `sgemm` @16384 | 0.9 TF | **15.2 TF** | 17× |
+| `fp8` @8192 | 16 TF | **64 TF** | 4× |
+| `hgemm_mix` / `bf16` | 이미 양호 | 동등 | ~0% |
+
+- 시작 시 후보를 실측하므로 **초기화가 수십 초~2분** 걸릴 수 있습니다(느린 후보가 많은
+  sgemm 대형 N 이 가장 느림). 급하면 `-A` 로 끄면 기본 커널로 즉시 시작합니다.
+- 후보 상한/반복은 `GB_AT_MAXCAND`/`GB_AT_ITERS`(backend 헤더) 컴파일 상수.
+
 모든 GEMM은 modern API(`cublasGemmEx` / `rocblas_gemm_ex`)로 통일되어 compute type과 data type이 명시 지정됩니다.
 
 ### 기본 정밀도 (`-p` 미지정)

@@ -241,6 +241,77 @@ static inline int gb_gemm(gb_blas_handle_t h, gb_prec_t prec,
     return (st == CUBLAS_STATUS_SUCCESS) ? 0 : -1;
 }
 
+#ifndef GB_AT_ITERS
+#define GB_AT_ITERS   4
+#endif
+
+/* 후보 1회 스크린 후 유망하면 iters 정밀 측정 (느린 후보 시간 폭증 방지). */
+#define GB_AT_TIME_CANDIDATE(CALL_EXPR, flop, stream, e0, e1, best, out_tf)   \
+    do {                                                                      \
+        (out_tf) = -1.0;                                                      \
+        if ((CALL_EXPR) != 0) break;                                          \
+        cudaStreamSynchronize(stream);                                        \
+        cudaEventRecord(e0, stream); (void)(CALL_EXPR);                       \
+        cudaEventRecord(e1, stream); cudaEventSynchronize(e1);                \
+        float _ms1 = 0; cudaEventElapsedTime(&_ms1, e0, e1);                  \
+        double _tf1 = (_ms1 > 0) ? (flop) / (_ms1 * 1e-3) * 1e-12 : 0;        \
+        (out_tf) = _tf1;                                                      \
+        if (_tf1 <= (best) * 0.5) break;                                      \
+        cudaStreamSynchronize(stream); cudaEventRecord(e0, stream);           \
+        for (int _k = 0; _k < GB_AT_ITERS; _k++) (void)(CALL_EXPR);           \
+        cudaEventRecord(e1, stream); cudaEventSynchronize(e1);                \
+        float _ms = 0; cudaEventElapsedTime(&_ms, e0, e1);                    \
+        if (_ms > 0) (out_tf) = (flop) / ((_ms / GB_AT_ITERS) * 1e-3) * 1e-12;\
+    } while (0)
+
+/* 실측 기반 최적 algo 선택 → 핸들에 캐시.
+   NVIDIA 는 fp8(cuBLASLt)만 autotune 실효 — cublasGemmEx 클래식 경로는 cuBLAS 가
+   내부 자동선택하며 cublasGemmAlgo_t 힌트는 최신 GPU 에서 대부분 무시되므로 no-op.
+   반환: 튜닝된 최고 TFLOPS(참고용). fp8 미해당/미튜닝이면 0. */
+static inline double gb_gemm_autotune(gb_blas_handle_t h, gb_prec_t prec,
+                                      int M, int N, int K,
+                                      const void *A, const void *B, void *C)
+{
+    if (prec != GB_PREC_FP8 && prec != GB_PREC_FP8_MIX)
+        return 0.0;   /* 클래식 경로: cuBLAS 기본 선택 사용 */
+
+    cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
+    const double flop = 2.0 * M * (double)N * K;
+    double best_tf = 0.0;
+
+    cudaDataType_t outT = (prec == GB_PREC_FP8) ? CUDA_R_8F_E4M3 : CUDA_R_16BF;
+    if (cublasLtMatmulDescCreate(&h->lt_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F)
+        == CUBLAS_STATUS_SUCCESS) {
+        cublasOperation_t opT = CUBLAS_OP_T, opN = CUBLAS_OP_N;
+        cublasLtMatmulDescSetAttribute(h->lt_desc, CUBLASLT_MATMUL_DESC_TRANSA, &opT, sizeof(opT));
+        cublasLtMatmulDescSetAttribute(h->lt_desc, CUBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN));
+        cublasLtMatrixLayoutCreate(&h->lt_lA, CUDA_R_8F_E4M3, K, M, K);
+        cublasLtMatrixLayoutCreate(&h->lt_lB, CUDA_R_8F_E4M3, K, N, K);
+        cublasLtMatrixLayoutCreate(&h->lt_lC, outT, M, N, M);
+        cublasLtMatrixLayoutCreate(&h->lt_lD, outT, M, N, M);
+        cublasLtMatmulPreference_t pref; cublasLtMatmulPreferenceCreate(&pref);
+        cublasLtMatmulPreferenceSetAttribute(pref,
+            CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &h->ws_sz, sizeof(h->ws_sz));
+        const int REQ = 64; cublasLtMatmulHeuristicResult_t cand[64]; int found = 0;
+        cublasLtMatmulAlgoGetHeuristic(h->lt, h->lt_desc,
+            h->lt_lA, h->lt_lB, h->lt_lC, h->lt_lD, pref, REQ, cand, &found);
+        cublasLtMatmulPreferenceDestroy(pref);
+        const float alpha = 1.f, beta = 0.f; int best_i = -1;
+        for (int i = 0; i < found; i++) {
+            double tf;
+            GB_AT_TIME_CANDIDATE(
+                (cublasLtMatmul(h->lt, h->lt_desc, &alpha, A,h->lt_lA, B,h->lt_lB,
+                     &beta, C,h->lt_lC, C,h->lt_lD, &cand[i].algo, h->ws, h->ws_sz,
+                     h->stream) == CUBLAS_STATUS_SUCCESS ? 0 : -1),
+                flop, h->stream, e0, e1, best_tf, tf);
+            if (tf > best_tf) { best_tf = tf; best_i = i; }
+        }
+        if (best_i >= 0) { h->lt_heur = cand[best_i]; h->lt_ready = 1; }
+    }
+    cudaEventDestroy(e0); cudaEventDestroy(e1);
+    return best_tf;
+}
+
 /* ─────────────────────────────────────────────────────────
    모니터링 (NVML)
    ─────────────────────────────────────────────────────────

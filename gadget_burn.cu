@@ -409,6 +409,7 @@ typedef struct {
     char     csv_path[512];     /* -o 인자: 출력 경로(파일/디렉터리). 빈 문자열=자동명 */
     Phase    plan[MAX_PHASES];  /* -S: TDP 스윕 plan */
     int      num_phases;        /* -S phase 개수. 0 = plan 미사용(단일 실행) */
+    int      autotune;          /* GEMM solution/algo autotune (기본 1, -A 로 끔) */
 } Config;
 
 /* 기본 행렬 크기 (M=N=K).
@@ -430,6 +431,7 @@ typedef struct {
     int            cur_c_idx;     /* 다음에 write할 C 슬롯 */
     int            M, N, K;
     PrecType       prec;
+    double         at_tflops;     /* autotune 이 찾은 최고 TFLOPS (0=미실행/미튜닝) */
 } GemmWorker;
 
 /* GPU 당 컨텍스트 */
@@ -547,11 +549,12 @@ static int calc_c_buffers(int device_id, MemSpec spec,
 
 static void worker_init(GemmWorker *w, int device_id,
                         int M, int N, int K, PrecType prec,
-                        int num_c_buffers, int use_random_init)
+                        int num_c_buffers, int use_random_init, int autotune)
 {
     w->device_id = device_id;
     w->M = M; w->N = N; w->K = K;
     w->prec = prec;
+    w->at_tflops = 0.0;
     w->num_c_buffers = (num_c_buffers < 1) ? 1 : num_c_buffers;
     w->cur_c_idx = 0;
 
@@ -595,6 +598,12 @@ static void worker_init(GemmWorker *w, int device_id,
         CUDA_CHECK(cudaMemset(w->dA, 1, szA));
         CUDA_CHECK(cudaMemset(w->dB, 1, szB));
     }
+
+    /* GEMM solution/algo autotune: 후보를 실측해 최고를 핸들에 캐시.
+       (rocBLAS 기본 solution 이 gfx1201 등에서 매우 나쁠 수 있어 큰 이득) */
+    if (autotune)
+        w->at_tflops = gb_gemm_autotune(w->handle, prec, M, N, K,
+                                        w->dA, w->dB, w->dC_ring);
 }
 
 static size_t worker_vram_bytes(const GemmWorker *w)
@@ -1544,6 +1553,10 @@ static void print_usage(const char *prog)
     printf("                 memset: cudaMemset(1) — denormal FP32 (TC switching 최소)\n");
     printf("                 rand  : xorshift PRNG로 random 데이터 (TC switching 풀가동)\n");
     printf("               비교 측정용 — 데이터 entropy가 TDP에 미치는 영향 분리 확인\n");
+    printf("  -A           GEMM autotune 끄기 (기본: 켜짐)\n");
+    printf("                 켜짐: 후보 solution/algo를 초기화 시 실측해 최적 커널 선택.\n");
+    printf("                 라이브러리 기본 선택이 나쁜 경우(예: gfx1201 sgemm/fp8) 큰 이득.\n");
+    printf("                 끄면 라이브러리 기본 solution 사용(초기화 빠름).\n");
     printf("  -P <와트>    전력 캡(TDP) 설정 [W] — GPU가 이 전력 안에서 운전 (root 필요)\n");
     printf("                 GPU 펌웨어가 클럭을 자동 조절. throttle에 PWR 표시는 정상.\n");
     printf("                 설정 가능 범위 밖이면 자동 클램프. 종료 시 원래 캡 복원.\n");
@@ -1742,6 +1755,7 @@ int main(int argc, char **argv)
     cfg.duration_sec        = 3600;
     cfg.intensity           = 1;
     cfg.prec                = GB_DEFAULT_PREC;  /* 백엔드별 (NVIDIA=sgemm_tf32, AMD=hgemm_mix) */
+    cfg.autotune            = 1;                /* GEMM solution/algo autotune 기본 ON (-A 로 끔) */
     cfg.mem_spec.is_percent = 1;
     cfg.mem_spec.value      = 100.0;
     cfg.init_mode           = INIT_RAND;
@@ -1749,7 +1763,7 @@ int main(int argc, char **argv)
 
     int list_only = 0;
     int opt;
-    while ((opt = getopt(argc, argv, "t:i:p:m:g:X:I:P:o::S:lh")) != -1) {
+    while ((opt = getopt(argc, argv, "t:i:p:m:g:X:I:P:o::S:Alh")) != -1) {
         switch (opt) {
         case 't': cfg.duration_sec      = atoi(optarg);                  break;
         case 'i': cfg.intensity         = atoi(optarg);                  break;
@@ -1799,6 +1813,7 @@ int main(int argc, char **argv)
             cfg.num_phases = n;
             break;
         }
+        case 'A': cfg.autotune = 0;                                      break;
         case 'l': list_only = 1;                                         break;
         case 'h': print_usage(argv[0]); return 0;
         default:  print_usage(argv[0]); return 1;
@@ -2014,14 +2029,20 @@ int main(int argc, char **argv)
 
         /* 워커 할당 및 초기화 */
         gc->workers = (GemmWorker *)calloc(cfg.intensity, sizeof(GemmWorker));
+        if (cfg.autotune)
+            printf("           %sautotune 중...%s (후보 solution/algo 실측)\n",
+                   CLR_CYAN, CLR_RESET);
         size_t total_vram = 0;
         for (int s = 0; s < cfg.intensity; s++) {
             worker_init(&gc->workers[s], gc->device_id,
                         gc->mat_size, gc->mat_size, gc->mat_size, gc->prec,
-                        num_c_buffers, use_random_init);
+                        num_c_buffers, use_random_init, cfg.autotune);
             total_vram += worker_vram_bytes(&gc->workers[s]);
         }
         gc->vram_used_mb = total_vram / (1024 * 1024);
+        if (cfg.autotune && gc->workers[0].at_tflops > 0.0)
+            printf("           %sautotune 완료%s: 최적 커널 %.1f TFLOPS\n",
+                   CLR_GREEN, CLR_RESET, gc->workers[0].at_tflops);
         printf("           VRAM 할당: %zu MiB\n", gc->vram_used_mb);
 
         /* 워밍업 */

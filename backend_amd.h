@@ -20,7 +20,10 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp8.h>
+/* rocblas_gemm_ex_get_solutions (autotune 용 solution 열거) 는 beta 기능 */
+#define ROCBLAS_BETA_FEATURES
 #include <rocblas/rocblas.h>
+#include <rocblas/internal/rocblas-beta.h>
 #include <hipblaslt/hipblaslt.h>
 #include <amd_smi/amdsmi.h>
 
@@ -130,6 +133,7 @@ typedef struct {
     void              *ws;
     size_t             ws_sz;
     hipStream_t        stream;
+    int                rb_sol;   /* autotune 이 고른 rocBLAS solution_index (0=기본) */
     /* fp8 실행계획: 첫 fp8 호출 시 lazy 구성 (worker 당 M,N,K,prec 고정 가정) */
     int                              lt_ready;
     hipblasLtMatmulDesc_t            lt_desc;
@@ -206,18 +210,16 @@ static inline int gb_gemm_fp8(gb_blas_handle_t h, gb_prec_t prec,
     return (st == HIPBLAS_STATUS_SUCCESS) ? 0 : -1;
 }
 
-static inline int gb_gemm(gb_blas_handle_t h, gb_prec_t prec,
-                          int M, int N, int K,
-                          const void *A, const void *B, void *C)
+/* rocBLAS GEMM 1회 실행 (solution_index 지정 가능).
+   sol==0 → rocBLAS 기본 선택(algo_standard), sol>0 → 지정 solution. */
+static inline rocblas_status rb_gemm_call(rocblas_handle rb, gb_prec_t prec,
+                                          int M, int N, int K,
+                                          const void *A, const void *B, void *C,
+                                          int sol)
 {
-    /* fp8 계열은 hipBLASLt 경로 (rocblas_gemm_ex 미지원) */
-    if (prec == GB_PREC_FP8 || prec == GB_PREC_FP8_MIX)
-        return gb_gemm_fp8(h, prec, M, N, K, A, B, C);
-
-    rocblas_handle rb = h->blas;
     const rocblas_operation opN = rocblas_operation_none;
-    const rocblas_gemm_algo algo = rocblas_gemm_algo_standard;
-    const int32_t  sol   = 0;
+    const rocblas_gemm_algo algo = (sol == 0) ? rocblas_gemm_algo_standard
+                                              : rocblas_gemm_algo_solution_index;
     const uint32_t flags = rocblas_gemm_flags_none;
     rocblas_status st;
 
@@ -279,7 +281,137 @@ static inline int gb_gemm(gb_blas_handle_t h, gb_prec_t prec,
         break;
     }
     }
-    return (st == rocblas_status_success) ? 0 : -1;
+    return st;
+}
+
+static inline int gb_gemm(gb_blas_handle_t h, gb_prec_t prec,
+                          int M, int N, int K,
+                          const void *A, const void *B, void *C)
+{
+    /* fp8 계열은 hipBLASLt 경로 (rocblas_gemm_ex 미지원) */
+    if (prec == GB_PREC_FP8 || prec == GB_PREC_FP8_MIX)
+        return gb_gemm_fp8(h, prec, M, N, K, A, B, C);
+    /* autotune 이 고른 solution(rb_sol) 사용 (미튜닝 시 0=기본) */
+    return (rb_gemm_call(h->blas, prec, M, N, K, A, B, C, h->rb_sol)
+            == rocblas_status_success) ? 0 : -1;
+}
+
+#ifndef GB_AT_ITERS
+#define GB_AT_ITERS   4      /* 유망 후보 정밀 측정 반복 */
+#define GB_AT_MAXCAND 96     /* solution 후보 상한 */
+#endif
+
+/* 후보 1개 실측 헬퍼: 먼저 1회(스크린)로 대략 속도를 재고, 현재 best 의 절반
+   이상으로 유망하면 iters 회로 정밀 재측정. 느린 후보는 1회 비용만 든다
+   (gfx1201 처럼 나쁜 solution 이 매우 느린 경우 autotune 시간 폭증 방지). */
+#define GB_AT_TIME_CANDIDATE(CALL_EXPR, flop, stream, e0, e1, best, out_tf)   \
+    do {                                                                      \
+        (out_tf) = -1.0;                                                      \
+        if ((CALL_EXPR) != 0) break;              /* 첫 호출 실패 → 무효 */    \
+        hipStreamSynchronize(stream);                                         \
+        hipEventRecord(e0, stream); (void)(CALL_EXPR);                        \
+        hipEventRecord(e1, stream); hipEventSynchronize(e1);                  \
+        float _ms1 = 0; hipEventElapsedTime(&_ms1, e0, e1);                   \
+        double _tf1 = (_ms1 > 0) ? (flop) / (_ms1 * 1e-3) * 1e-12 : 0;        \
+        (out_tf) = _tf1;                                                      \
+        if (_tf1 <= (best) * 0.5) break;          /* 명백히 느림 → 스킵 */    \
+        hipStreamSynchronize(stream); hipEventRecord(e0, stream);             \
+        for (int _k = 0; _k < GB_AT_ITERS; _k++) (void)(CALL_EXPR);           \
+        hipEventRecord(e1, stream); hipEventSynchronize(e1);                  \
+        float _ms = 0; hipEventElapsedTime(&_ms, e0, e1);                     \
+        if (_ms > 0) (out_tf) = (flop) / ((_ms / GB_AT_ITERS) * 1e-3) * 1e-12;\
+    } while (0)
+
+static inline void rb_prec_types(gb_prec_t p, rocblas_datatype *io, rocblas_datatype *comp)
+{
+    switch (p) {
+        case GB_PREC_DGEMM:     *io=rocblas_datatype_f64_r;  *comp=rocblas_datatype_f64_r; break;
+        case GB_PREC_HGEMM:     *io=rocblas_datatype_f16_r;  *comp=rocblas_datatype_f16_r; break;
+        case GB_PREC_HGEMM_MIX: *io=rocblas_datatype_f16_r;  *comp=rocblas_datatype_f32_r; break;
+        case GB_PREC_BF16:      *io=rocblas_datatype_bf16_r; *comp=rocblas_datatype_f32_r; break;
+        default:                *io=rocblas_datatype_f32_r;  *comp=rocblas_datatype_f32_r; break;
+    }
+}
+
+/* 실측 기반 최적 solution/algo 선택 → 핸들에 캐시. worker 버퍼(A,B,C)/스트림 사용.
+   반환: 캐시된 최고 TFLOPS(참고용). 이후 gb_gemm 이 이 solution/algo 를 사용. */
+static inline double gb_gemm_autotune(gb_blas_handle_t h, gb_prec_t prec,
+                                      int M, int N, int K,
+                                      const void *A, const void *B, void *C)
+{
+    hipEvent_t e0, e1; hipEventCreate(&e0); hipEventCreate(&e1);
+    const double flop = 2.0 * M * (double)N * K;
+    double best_tf = 0.0;
+
+    if (prec == GB_PREC_FP8 || prec == GB_PREC_FP8_MIX) {
+        hipDataType outT = (prec == GB_PREC_FP8) ? HIP_R_8F_E4M3 : HIP_R_16BF;
+        if (hipblasLtMatmulDescCreate(&h->lt_desc, HIPBLAS_COMPUTE_32F, HIP_R_32F)
+            == HIPBLAS_STATUS_SUCCESS) {
+            hipblasLtMatrixLayoutCreate(&h->lt_lA, HIP_R_8F_E4M3, M, K, M);
+            hipblasLtMatrixLayoutCreate(&h->lt_lB, HIP_R_8F_E4M3, K, N, K);
+            hipblasLtMatrixLayoutCreate(&h->lt_lC, outT, M, N, M);
+            hipblasLtMatrixLayoutCreate(&h->lt_lD, outT, M, N, M);
+            hipblasLtMatmulPreference_t pref; hipblasLtMatmulPreferenceCreate(&pref);
+            hipblasLtMatmulPreferenceSetAttribute(pref,
+                HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &h->ws_sz, sizeof(h->ws_sz));
+            const int REQ = 64; hipblasLtMatmulHeuristicResult_t cand[64]; int found = 0;
+            hipblasLtMatmulAlgoGetHeuristic(h->lt, h->lt_desc,
+                h->lt_lA, h->lt_lB, h->lt_lC, h->lt_lD, pref, REQ, cand, &found);
+            hipblasLtMatmulPreferenceDestroy(pref);
+            const float alpha = 1.f, beta = 0.f; int best_i = -1;
+            for (int i = 0; i < found; i++) {
+                double tf;
+                GB_AT_TIME_CANDIDATE(
+                    (hipblasLtMatmul(h->lt, h->lt_desc, &alpha, A,h->lt_lA, B,h->lt_lB,
+                         &beta, C,h->lt_lC, C,h->lt_lD, &cand[i].algo, h->ws, h->ws_sz,
+                         h->stream) == HIPBLAS_STATUS_SUCCESS ? 0 : -1),
+                    flop, h->stream, e0, e1, best_tf, tf);
+                if (tf > best_tf) { best_tf = tf; best_i = i; }
+            }
+            if (best_i >= 0) { h->lt_heur = cand[best_i]; h->lt_ready = 1; }
+        }
+    } else {
+        rocblas_datatype io, comp; rb_prec_types(prec, &io, &comp);
+        double d1=1,d0=0; float f1=1,f0=0; rocblas_half hh1={0x3C00}, hh0={0x0000};
+        const void *pa=&f1, *pb=&f0;
+        if (comp == rocblas_datatype_f64_r)      { pa=&d1; pb=&d0; }
+        else if (comp == rocblas_datatype_f16_r) { pa=&hh1; pb=&hh0; }
+
+        int best_sol = 0;
+        /* 기본(solution_index=0) 을 baseline 으로 측정 */
+        { double tf0;
+          GB_AT_TIME_CANDIDATE(
+              (rb_gemm_call(h->blas, prec, M,N,K, A,B,C, 0)==rocblas_status_success?0:-1),
+              flop, h->stream, e0, e1, best_tf, tf0);
+          if (tf0 > best_tf) best_tf = tf0; }
+        /* 전체 solution 열거 (beta API) 후 각각 실측 */
+        rocblas_int cnt = 0;
+        rocblas_gemm_ex_get_solutions(h->blas, rocblas_operation_none, rocblas_operation_none,
+            M,N,K, pa, A,io,M, B,io,K, pb, C,io,M, C,io,M, comp,
+            rocblas_gemm_algo_solution_index, rocblas_gemm_flags_none, NULL, &cnt);
+        if (cnt > 0) {
+            if (cnt > GB_AT_MAXCAND) cnt = GB_AT_MAXCAND;
+            rocblas_int *sols = (rocblas_int*)malloc((size_t)cnt * sizeof(rocblas_int));
+            rocblas_int got = cnt;
+            if (sols && rocblas_gemm_ex_get_solutions(h->blas, rocblas_operation_none,
+                    rocblas_operation_none, M,N,K, pa, A,io,M, B,io,K, pb, C,io,M, C,io,M,
+                    comp, rocblas_gemm_algo_solution_index, rocblas_gemm_flags_none, sols, &got)
+                == rocblas_status_success) {
+                for (int i = 0; i < got; i++) {
+                    if (sols[i] == 0) continue;
+                    double tf;
+                    GB_AT_TIME_CANDIDATE(
+                        (rb_gemm_call(h->blas, prec, M,N,K, A,B,C, sols[i])==rocblas_status_success?0:-1),
+                        flop, h->stream, e0, e1, best_tf, tf);
+                    if (tf > best_tf) { best_tf = tf; best_sol = sols[i]; }
+                }
+            }
+            free(sols);
+        }
+        h->rb_sol = best_sol;
+    }
+    hipEventDestroy(e0); hipEventDestroy(e1);
+    return best_tf;
 }
 
 /* ─────────────────────────────────────────────────────────

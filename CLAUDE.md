@@ -35,7 +35,7 @@ make info                     # 바이너리에 포함된 GPU 코드 목록(NVID
 ./gadget_burn -h              # 도움말
 ```
 
-주요 옵션: `-t`(초) `-i`(동시 스트림 수) `-p`(정밀도) `-m`(VRAM% 또는 행렬크기)
+주요 옵션: `-A`(GEMM autotune 끄기; 기본 켜짐) `-t`(초) `-i`(동시 스트림 수) `-p`(정밀도) `-m`(VRAM% 또는 행렬크기)
 `-g`(GPU ID 목록) `-X`(행렬 크기 M override) `-I`(memset|rand 초기화)
 `-P`(전력 캡/TDP 설정 [W], root 필요·종료 시 복원)
 `-o`(CSV 기록 [경로], 1Hz long/tidy + `#` 메타 헤더, pandas/gnuplot 호환)
@@ -100,6 +100,12 @@ make info                     # 바이너리에 포함된 GPU 코드 목록(NVID
 - **백엔드별 기본 정밀도가 다름**: NVIDIA=`sgemm_tf32`(gpu-burn -tc 호환),
   AMD=`hgemm_mix`(Matrix Core 네이티브 고속 경로). TF32 미지원 HW는 FP32로 폴백.
 - **AMD throttle 비트는 보수적 매핑**(현재 0이 아니면 POWER_BRAKE). gfx별 정밀화는 TODO.
+- **autotune(기본 켜짐, -A 로 끔)**: BLAS 기본 커널 선택이 gfx1201 에서 매우 나쁠 수 있어
+  (sgemm 16384: 기본 0.9 → 튜닝 15 TFLOPS, 17×), worker 초기화 시 후보 solution/algo 를
+  실측해 최적을 캐시(`gb_gemm_autotune`, 핸들의 `rb_sol`/`lt_heur` 에 저장). rocBLAS 는
+  `rocblas_gemm_ex_get_solutions`(beta API, `ROCBLAS_BETA_FEATURES`), Lt 는 heuristic 리스트.
+  느린 후보로 초기화가 수십 초~2분 걸릴 수 있음(early-abort 스크린으로 제한). NVIDIA 클래식
+  경로(cublasGemmEx)는 no-op(cuBLAS 기본이 이미 양호).
 - **fp8(-p fp8/fp8_mix)은 Lt 경로**(hipBLASLt/cuBLASLt). 주의: ① 소비자 RDNA4(gfx1201)의
   hipBLASLt fp8 커널이 미성숙해 실측이 이론(2×fp16)에 크게 못 미침(Peak% 낮게 = 정직). ②
   fp8(e4m3 출력)은 N=8192·16384 에서 커널 갭으로 저성능 → `fp8_mix`나 다른 크기 권장. ③
