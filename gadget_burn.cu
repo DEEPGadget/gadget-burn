@@ -13,7 +13,7 @@
  *
  *   -t <초>       총 측정 시간                       (기본: 3600)
  *   -i <강도>     GPU 당 동시 GEMM 스트림 수         (기본: 1)
- *   -p <타입>     sgemm | dgemm | hgemm | hgemm_mix | bf16 | sgemm_tf32  (기본: sgemm_tf32)
+ *   -p <타입>     sgemm|dgemm|hgemm|hgemm_mix|bf16|fp8|fp8_mix|sgemm_tf32 (기본: sgemm_tf32)
  *                 hgemm      → FP16 in / FP16 acc Tensor Core (피크 TFLOPS 최대)
  *                 hgemm_mix  → FP16 in / FP32 acc Tensor Core (mixed precision)
  *                 sgemm_tf32 → FP32 storage + TF32 Tensor Core (기본, gpu-burn -tc 호환)
@@ -142,6 +142,21 @@ extern "C" __global__ void init_random_bf16(gb_bfloat16 *buf, size_t n, unsigned
     }
 }
 
+extern "C" __global__ void init_random_fp8(gb_fp8 *buf, size_t n, unsigned seed)
+{
+    size_t stride = (size_t)blockDim.x * gridDim.x;
+    for (size_t tid = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+         tid < n; tid += stride) {
+        unsigned int s = (unsigned int)(tid * 2654435761u) ^ seed;
+        s = xorshift32(s);
+        s = xorshift32(s);
+        /* e4m3 max ~448, 가수 3bit. K 누산(FP32) overflow 및 출력 e4m3 clamp 를
+           피하려고 [0, 1.0) 소값으로 채운다. */
+        float val = (float)s * (1.0f / 4294967296.0f);
+        buf[tid] = (gb_fp8)val;
+    }
+}
+
 /* random init 호출 도우미: precision에 맞춰 커널 dispatch */
 
 /* ─────────────────────────────────────────────────────────
@@ -212,6 +227,9 @@ typedef struct {
                                     sgemm Rpeak 를 cores_tensor × 이 값 으로 계산.
                                     NVIDIA 와 RDNA(매트릭스 FP32 미지원)는 0 →
                                     기존 FP32 vector(cores_fp32 × 2) 기준 유지. */
+    int         tc_ops_fp8;      /* FP8(e4m3) matrix ops/cycle (cores_tensor 단위당).
+                                    fp8 지원 HW 는 FP16 의 2배 = 2×tc_ops_mix.
+                                    0 = fp8 미지원 → 본체가 -p fp8 요청 시 명시 종료. */
 } CoreEntry;
 
 /* GPU 코어 DB. 엔트리는 백엔드별 헤더에서 매크로로 주입됩니다:
@@ -228,7 +246,7 @@ static const CoreEntry CORE_TABLE[] = {
     GB_AMD_CORE_ENTRIES
 #endif
     /* sentinel */
-    { NULL, 0, 0, 0, 0, 0, 0 }
+    { NULL, 0, 0, 0, 0, 0, 0, 0, 0 }
 };
 
 /* GPU 이름으로 CoreEntry 검색 (대소문자 무시, substring 매칭) */
@@ -298,6 +316,8 @@ typedef gb_prec_t PrecType;
 #define PREC_HGEMM_MIX   GB_PREC_HGEMM_MIX
 #define PREC_SGEMM_TF32  GB_PREC_SGEMM_TF32
 #define PREC_BF16        GB_PREC_BF16
+#define PREC_FP8         GB_PREC_FP8
+#define PREC_FP8_MIX     GB_PREC_FP8_MIX
 
 /* random init dispatch helper (PrecType 정의 후) */
 static void init_buffer_random(void *buf, size_t n_elem, PrecType prec,
@@ -319,10 +339,39 @@ static void init_buffer_random(void *buf, size_t n_elem, PrecType prec,
             init_random_bf16<<<blocks, threads, 0, stream>>>(
                 (gb_bfloat16 *)buf, n_elem, seed);
             break;
+        case PREC_FP8:
+        case PREC_FP8_MIX:
+            init_random_fp8<<<blocks, threads, 0, stream>>>(
+                (gb_fp8 *)buf, n_elem, seed);
+            break;
         default:
             init_random_f32<<<blocks, threads, 0, stream>>>(
                 (float *)buf, n_elem, seed);
             break;
+    }
+}
+
+/* 정밀도별 입력(A,B) / 출력(C) 요소 바이트 수.
+   대부분 in==out 이지만 fp8_mix 는 입력 1B(e4m3) / 출력 2B(bf16) 로 다르다. */
+static inline size_t prec_in_bpe(PrecType p)
+{
+    switch (p) {
+        case PREC_DGEMM:                     return 8;
+        case PREC_HGEMM: case PREC_HGEMM_MIX:
+        case PREC_BF16:                      return 2;
+        case PREC_FP8:   case PREC_FP8_MIX:  return 1;
+        default:                             return 4;   /* sgemm / tf32 */
+    }
+}
+static inline size_t prec_out_bpe(PrecType p)
+{
+    switch (p) {
+        case PREC_DGEMM:                     return 8;
+        case PREC_HGEMM: case PREC_HGEMM_MIX:
+        case PREC_BF16:                      return 2;
+        case PREC_FP8:                       return 1;   /* e4m3 out */
+        case PREC_FP8_MIX:                   return 2;   /* bf16 out */
+        default:                             return 4;
     }
 }
 
@@ -478,17 +527,11 @@ static int calc_c_buffers(int device_id, MemSpec spec,
                        ? (size_t)(usable * (spec.value / 100.0))
                        : usable;
 
-    size_t bpe;
-    switch (prec) {
-        case PREC_DGEMM:     bpe = 8; break;
-        case PREC_HGEMM:
-        case PREC_HGEMM_MIX:
-        case PREC_BF16:      bpe = 2; break;
-        default:             bpe = 4; break;
-    }
+    size_t in_bpe  = prec_in_bpe(prec);
+    size_t out_bpe = prec_out_bpe(prec);
 
-    size_t c_bytes  = bpe * (size_t)M * (size_t)M;
-    size_t ab_bytes = 2 * c_bytes * intensity;
+    size_t c_bytes  = out_bpe * (size_t)M * (size_t)M;          /* C 슬롯 1개 */
+    size_t ab_bytes = 2 * in_bpe * (size_t)M * (size_t)M * intensity;  /* A+B */
     if (target <= ab_bytes) return 4;
 
     size_t ring_budget = (target - ab_bytes) / intensity;
@@ -525,18 +568,12 @@ static void worker_init(GemmWorker *w, int device_id,
     CUDA_CHECK(cudaEventCreate(&w->ev_start));
     CUDA_CHECK(cudaEventCreate(&w->ev_stop));
 
-    size_t bpe;
-    switch (prec) {
-        case PREC_DGEMM:     bpe = sizeof(double); break;
-        case PREC_HGEMM:
-        case PREC_HGEMM_MIX:
-        case PREC_BF16:      bpe = sizeof(gb_bfloat16); break;
-        default:             bpe = sizeof(float);   break;
-    }
+    size_t in_bpe  = prec_in_bpe(prec);
+    size_t out_bpe = prec_out_bpe(prec);
 
-    size_t szA = (size_t)M * K * bpe;
-    size_t szB = (size_t)K * N * bpe;
-    size_t szC = (size_t)M * N * bpe;
+    size_t szA = (size_t)M * K * in_bpe;
+    size_t szB = (size_t)K * N * in_bpe;
+    size_t szC = (size_t)M * N * out_bpe;
 
     CUDA_CHECK(cudaMalloc(&w->dA, szA));
     CUDA_CHECK(cudaMalloc(&w->dB, szB));
@@ -562,17 +599,10 @@ static void worker_init(GemmWorker *w, int device_id,
 
 static size_t worker_vram_bytes(const GemmWorker *w)
 {
-    size_t bpe;
-    switch (w->prec) {
-        case PREC_DGEMM:     bpe = 8; break;
-        case PREC_HGEMM:
-        case PREC_HGEMM_MIX:
-        case PREC_BF16:      bpe = 2; break;
-        default:             bpe = 4; break;
-    }
-    /* A + B + (C × num_c_buffers) */
-    size_t one_mat = bpe * (size_t)w->M * (size_t)w->N;
-    return one_mat * (2 + (size_t)w->num_c_buffers);
+    /* A + B (입력 bpe) + C × num_c_buffers (출력 bpe) */
+    size_t ab = 2 * prec_in_bpe(w->prec) * (size_t)w->M * (size_t)w->N;
+    size_t c1 = prec_out_bpe(w->prec) * (size_t)w->M * (size_t)w->N;
+    return ab + c1 * (size_t)w->num_c_buffers;
 }
 
 static void worker_free(GemmWorker *w)
@@ -596,15 +626,7 @@ static void worker_free(GemmWorker *w)
    non-burn (num_c_buffers=1)이면 dC_ring 그대로. */
 static void *current_c_ptr(const GemmWorker *w)
 {
-    size_t bpe;
-    switch (w->prec) {
-        case PREC_DGEMM:     bpe = sizeof(double); break;
-        case PREC_HGEMM:
-        case PREC_HGEMM_MIX:
-        case PREC_BF16:      bpe = sizeof(gb_bfloat16); break;
-        default:             bpe = sizeof(float);   break;
-    }
-    size_t one = bpe * (size_t)w->M * (size_t)w->N;
+    size_t one = prec_out_bpe(w->prec) * (size_t)w->M * (size_t)w->N;   /* C=출력 bpe */
     return (char *)w->dC_ring + (size_t)w->cur_c_idx * one;
 }
 
@@ -852,6 +874,12 @@ static double calc_dynamic_rpeak(const GpuCtx *gc, PrecType prec, double clock_m
             /* BF16 은 대부분 HW 에서 FP16(mix) 과 동일 matrix 처리율 */
             return gc->core_info.cores_tensor
                    * (double)gc->core_info.tc_ops_mix * clock_mhz * 1e-6;
+        case PREC_FP8:
+        case PREC_FP8_MIX:
+            /* fp8 = FP16 의 2배(=2×tc_ops_mix). 미지원 HW(tc_ops_fp8=0)는
+               본체가 -p fp8 요청 시 시작 단계에서 명시 종료하므로 여기 도달 안 함. */
+            return gc->core_info.cores_tensor
+                   * (double)gc->core_info.tc_ops_fp8 * clock_mhz * 1e-6;
         case PREC_SGEMM_TF32:
             /* TF32 미지원 GPU (Turing/Volta, tc_ops_tf32=0)에서는 cuBLAS가 자동으로
                FP32 SGEMM으로 fallback. 실제 workload는 FP32 shader이므로 Peak%도
@@ -1105,6 +1133,8 @@ static const char *prec_label(PrecType p)
     case PREC_HGEMM:      return "HGEMM (FP16 in / FP16 acc)";
     case PREC_HGEMM_MIX:  return "HGEMM_MIX (FP16 in / FP32 acc)";
     case PREC_BF16:       return "BF16 (BF16 in / FP32 acc)";
+    case PREC_FP8:        return "FP8 (e4m3 in / e4m3 out, FP32 acc)";
+    case PREC_FP8_MIX:    return "FP8_MIX (e4m3 in / BF16 out, FP32 acc)";
     case PREC_SGEMM_TF32: return "SGEMM_TF32 (FP32 storage / TF32 compute)";
     case PREC_SGEMM:
     default:              return "SGEMM (FP32)";
@@ -1475,14 +1505,17 @@ static void print_usage(const char *prog)
     printf("\n사용법: %s [옵션]\n\n", prog);
     printf("  -t <초>      총 측정 시간                          (기본: 3600)\n");
     printf("  -i <강도>    GPU 당 동시 GEMM 스트림 수            (기본: 1)\n");
-    printf("  -p <타입>    sgemm | dgemm | hgemm | hgemm_mix | bf16 | sgemm_tf32   (기본: %s)\n",
-           GB_DEFAULT_PREC_NAME);
+    printf("  -p <타입>    sgemm | dgemm | hgemm | hgemm_mix | bf16 | fp8 | fp8_mix | sgemm_tf32\n");
+    printf("               (기본: %s)\n", GB_DEFAULT_PREC_NAME);
     printf("               sgemm      → FP32 (cublasGemmEx, COMPUTE_32F)\n");
     printf("               dgemm      → FP64 (cublasGemmEx, COMPUTE_64F)\n");
     printf("               hgemm      → FP16 in / FP16 acc Tensor Core\n");
     printf("                            이론 피크 TFLOPS가 가장 높음\n");
     printf("               bf16       → BF16 in / FP32 acc Tensor/Matrix Core\n");
     printf("                            FP16(mix)과 동일 처리율, 넓은 지수부(FP32급 범위)\n");
+    printf("               fp8        → FP8(e4m3) in / e4m3 out (hipBLASLt/cuBLASLt)\n");
+    printf("                            지원 HW 는 FP16 의 2배 처리율. 미지원 HW 는 종료.\n");
+    printf("               fp8_mix    → FP8(e4m3) in / BF16 out (고정밀 출력)\n");
 #if defined(GB_BACKEND_AMD)
     printf("               hgemm_mix  → FP16 in / FP32 acc Matrix Core (mixed precision) [기본]\n");
     printf("                            AMD Matrix Core(WMMA/MFMA)의 네이티브 고속 경로,\n");
@@ -1735,6 +1768,8 @@ int main(int argc, char **argv)
             else if (!strcmp(optarg, "hgemm_mix"))  cfg.prec = PREC_HGEMM_MIX;
             else if (!strcmp(optarg, "hgemm"))      cfg.prec = PREC_HGEMM;
             else if (!strcmp(optarg, "bf16"))       cfg.prec = PREC_BF16;
+            else if (!strcmp(optarg, "fp8"))        cfg.prec = PREC_FP8;
+            else if (!strcmp(optarg, "fp8_mix"))    cfg.prec = PREC_FP8_MIX;
             else if (!strcmp(optarg, "sgemm_tf32")) cfg.prec = PREC_SGEMM_TF32;
             else if (!strcmp(optarg, "sgemm"))      cfg.prec = PREC_SGEMM;
             else                                    cfg.prec = GB_DEFAULT_PREC;
@@ -1824,7 +1859,9 @@ int main(int argc, char **argv)
         "HGEMM (FP16 in / FP16 acc, Tensor Core)",
         "HGEMM_MIX (FP16 in / FP32 acc, Tensor Core, mixed precision)",
         "SGEMM_TF32 (FP32 storage, TF32 Tensor Core compute)",
-        "BF16 (BF16 in / FP32 acc, Tensor/Matrix Core)"
+        "BF16 (BF16 in / FP32 acc, Tensor/Matrix Core)",
+        "FP8 (e4m3 in / e4m3 out, FP32 acc, hipBLASLt/cuBLASLt)",
+        "FP8_MIX (e4m3 in / BF16 out, FP32 acc, hipBLASLt/cuBLASLt)"
     };
 
     /* ── 실행 설정 헤더 출력 ── */
@@ -1912,6 +1949,17 @@ int main(int argc, char **argv)
         else
             memset(&gc->core_info, 0, sizeof(CoreEntry));
 
+        /* fp8 요청 시 HW 지원 확인 (tc_ops_fp8=0 → 미지원). 조용한 폴백 대신
+           명시적으로 종료해 사용자가 잘못된 결과를 얻지 않도록 한다. */
+        if ((cfg.prec == PREC_FP8 || cfg.prec == PREC_FP8_MIX)
+            && gc->core_info.tc_ops_fp8 == 0) {
+            fprintf(stderr,
+                "\n오류: GPU %d (%s) 는 fp8(-p %s) 을 지원하지 않습니다.\n"
+                "      fp8 가속은 RDNA4 / CDNA3+ (또는 NVIDIA Ada/Hopper+) 에서만 가능합니다.\n",
+                gc->logical_id, prop.name, prec_label(cfg.prec));
+            exit(EXIT_FAILURE);
+        }
+
         char bdf[32] = "?";
         cudaDeviceGetPCIBusId(bdf, (int)sizeof(bdf), gc->device_id);
         printf("  [초기화] GPU %d: %s  [%s]", gc->logical_id, prop.name, bdf);
@@ -1995,15 +2043,8 @@ int main(int argc, char **argv)
         phases[0].duration_s = cfg.duration_sec;
     }
 
-    /* bytes/element (메모리 BW 추정 등에 사용) */
-    size_t bpe;
-    switch (cfg.prec) {
-        case PREC_DGEMM:     bpe = 8; break;
-        case PREC_HGEMM:
-        case PREC_HGEMM_MIX:
-        case PREC_BF16:      bpe = 2; break;
-        default:             bpe = 4; break;
-    }
+    /* bytes/element (메모리 BW 추정용). A·B·C 혼합 시 입력 bpe 기준(추정치). */
+    size_t bpe = prec_in_bpe(cfg.prec);
 
     /* CSV 로깅 파일 오픈 (-o). GPU 초기화 후라 이름·BDF·TDP캡이 모두 확정됨. */
     FILE *csv = NULL;

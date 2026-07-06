@@ -73,6 +73,8 @@ make amd        # AMD (빌드 머신 GPU 자동 감지)
 | `hgemm` | FP16 in / FP16 acc |
 | `hgemm_mix` | FP16 in / FP32 acc (mixed precision) |
 | `bf16` | BF16 in / FP32 acc (Tensor/Matrix Core) |
+| `fp8` | FP8(e4m3) in / e4m3 out (hipBLASLt/cuBLASLt) |
+| `fp8_mix` | FP8(e4m3) in / BF16 out |
 | `sgemm_tf32` | FP32 storage + TF32 compute |
 
 **기본값은 백엔드별로 다릅니다**: NVIDIA=`sgemm_tf32`(gpu-burn -tc 호환), AMD=`hgemm_mix`(Matrix Core 네이티브 고속 경로). 정밀도별 Rpeak 계산과 NVIDIA Tensor Core / AMD RDNA·CDNA OPS 체계는 → **[정밀도와 Rpeak](docs/precision.md)**
@@ -83,7 +85,7 @@ make amd        # AMD (빌드 머신 GPU 자동 감지)
 |---|---|---|
 | `-t <초>` | 총 측정 시간 | `3600` |
 | `-i <강도>` | GPU 당 동시 GEMM 스트림 수 | `1` |
-| `-p <타입>` | `sgemm`/`dgemm`/`hgemm`/`hgemm_mix`/`bf16`/`sgemm_tf32` | 백엔드별 |
+| `-p <타입>` | `sgemm`/`dgemm`/`hgemm`/`hgemm_mix`/`bf16`/`fp8`/`fp8_mix`/`sgemm_tf32` | 백엔드별 |
 | `-m <값>` | 메모리 사용량 (`80%` 또는 `8192`) | `100%` |
 | `-g <목록>` | 사용할 GPU ID (쉼표 구분) | 전체 |
 | `-X <크기>` | 행렬 크기 M override (`8192`/`16384`/`32768`) | `16384` |

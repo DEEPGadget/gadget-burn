@@ -19,7 +19,9 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <hip/hip_bf16.h>
+#include <hip/hip_fp8.h>
 #include <rocblas/rocblas.h>
+#include <hipblaslt/hipblaslt.h>
 #include <amd_smi/amdsmi.h>
 
 /* AMD GPU 코어 DB (동적 Rpeak 계산용 GB_AMD_CORE_ENTRIES 매크로 제공).
@@ -75,6 +77,9 @@ static inline gb_half gb_float2half(float f) { return __float2half(f); }
 /* GPU bfloat16 타입 (BF16 in / FP32 acc 경로용). HIP 는 __hip_bfloat16 제공. */
 typedef __hip_bfloat16 gb_bfloat16;
 
+/* GPU fp8 타입 (OCP e4m3). RDNA4(gfx1201)/CDNA 의 fp8 GEMM 입력용. */
+typedef __hip_fp8_e4m3 gb_fp8;
+
 typedef hipStream_t gb_stream_t;
 
 /* 디바이스 열거 순서 정렬: HIP 는 기본적으로 PCI 버스 순서로 열거되고
@@ -116,24 +121,100 @@ static inline void gb_init_device_order(void) { (void)0; }
    경로가 없고, XF32 가속은 CDNA(MI200+) 의 xDL 에서만 동작합니다.
    RDNA3(gfx1100) 등에서는 일반 f32_r 로 폴백합니다 (정확성 유지, TC 미가속).
    ───────────────────────────────────────────────────────── */
-typedef rocblas_handle gb_blas_handle_t;
+/* fp8(e4m3) GEMM 은 rocblas_gemm_ex 경로에 없고 hipBLASLt 가 담당하므로,
+   핸들에 rocBLAS 핸들 + hipBLASLt 핸들 + workspace + fp8 실행계획 캐시를 함께
+   보관한다. 본체는 gb_blas_handle_t 를 opaque 하게만 사용(포인터). */
+typedef struct {
+    rocblas_handle     blas;
+    hipblasLtHandle_t  lt;
+    void              *ws;
+    size_t             ws_sz;
+    hipStream_t        stream;
+    /* fp8 실행계획: 첫 fp8 호출 시 lazy 구성 (worker 당 M,N,K,prec 고정 가정) */
+    int                              lt_ready;
+    hipblasLtMatmulDesc_t            lt_desc;
+    hipblasLtMatrixLayout_t          lt_lA, lt_lB, lt_lC, lt_lD;
+    hipblasLtMatmulHeuristicResult_t lt_heur;
+} gb_blas_ctx_t;
+typedef gb_blas_ctx_t* gb_blas_handle_t;
 
 static inline int gb_blas_create(gb_blas_handle_t *h, gb_stream_t stream)
 {
-    if (rocblas_create_handle(h) != rocblas_status_success) return -1;
-    rocblas_set_stream(*h, stream);
+    gb_blas_ctx_t *c = (gb_blas_ctx_t *)calloc(1, sizeof(gb_blas_ctx_t));
+    if (!c) return -1;
+    c->stream = stream;
+    if (rocblas_create_handle(&c->blas) != rocblas_status_success) { free(c); return -1; }
+    rocblas_set_stream(c->blas, stream);
+    /* hipBLASLt 핸들 + workspace (fp8 전용, 다른 정밀도는 미사용) */
+    if (hipblasLtCreate(&c->lt) != HIPBLAS_STATUS_SUCCESS) {
+        rocblas_destroy_handle(c->blas); free(c); return -1;
+    }
+    c->ws_sz = 128ull * 1024 * 1024;   /* 128MB Lt workspace */
+    if (hipMalloc(&c->ws, c->ws_sz) != hipSuccess) { c->ws = NULL; c->ws_sz = 0; }
+    *h = c;
     return 0;
 }
 
 static inline void gb_blas_destroy(gb_blas_handle_t h)
 {
-    rocblas_destroy_handle(h);
+    if (!h) return;
+    if (h->lt_ready) {
+        hipblasLtMatrixLayoutDestroy(h->lt_lA);
+        hipblasLtMatrixLayoutDestroy(h->lt_lB);
+        hipblasLtMatrixLayoutDestroy(h->lt_lC);
+        hipblasLtMatrixLayoutDestroy(h->lt_lD);
+        hipblasLtMatmulDescDestroy(h->lt_desc);
+    }
+    if (h->ws) hipFree(h->ws);
+    hipblasLtDestroy(h->lt);
+    rocblas_destroy_handle(h->blas);
+    free(h);
+}
+
+/* fp8(e4m3) GEMM via hipBLASLt.
+     GB_PREC_FP8     : e4m3 in / e4m3 out
+     GB_PREC_FP8_MIX : e4m3 in / bf16 out
+   compute=FP32 (gfx1201 에서 유효한 유일 경로; fp16 누산은 무효 커널).
+   첫 호출 시 desc/layout/algo 를 캐시. 지원 algo 가 없으면 -1(→ 본체가 종료). */
+static inline int gb_gemm_fp8(gb_blas_handle_t h, gb_prec_t prec,
+                              int M, int N, int K,
+                              const void *A, const void *B, void *C)
+{
+    if (!h->lt_ready) {
+        hipDataType outT = (prec == GB_PREC_FP8) ? HIP_R_8F_E4M3 : HIP_R_16BF;
+        if (hipblasLtMatmulDescCreate(&h->lt_desc, HIPBLAS_COMPUTE_32F, HIP_R_32F)
+            != HIPBLAS_STATUS_SUCCESS) return -1;
+        hipblasLtMatrixLayoutCreate(&h->lt_lA, HIP_R_8F_E4M3, M, K, M);
+        hipblasLtMatrixLayoutCreate(&h->lt_lB, HIP_R_8F_E4M3, K, N, K);
+        hipblasLtMatrixLayoutCreate(&h->lt_lC, outT, M, N, M);
+        hipblasLtMatrixLayoutCreate(&h->lt_lD, outT, M, N, M);
+        hipblasLtMatmulPreference_t pref;
+        if (hipblasLtMatmulPreferenceCreate(&pref) != HIPBLAS_STATUS_SUCCESS) return -1;
+        hipblasLtMatmulPreferenceSetAttribute(pref,
+            HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &h->ws_sz, sizeof(h->ws_sz));
+        int found = 0;
+        hipblasStatus_t hs = hipblasLtMatmulAlgoGetHeuristic(h->lt, h->lt_desc,
+            h->lt_lA, h->lt_lB, h->lt_lC, h->lt_lD, pref, 1, &h->lt_heur, &found);
+        hipblasLtMatmulPreferenceDestroy(pref);
+        if (hs != HIPBLAS_STATUS_SUCCESS || found == 0) return -1;
+        h->lt_ready = 1;
+    }
+    const float alpha = 1.f, beta = 0.f;
+    hipblasStatus_t st = hipblasLtMatmul(h->lt, h->lt_desc, &alpha,
+        A, h->lt_lA, B, h->lt_lB, &beta,
+        C, h->lt_lC, C, h->lt_lD, &h->lt_heur.algo, h->ws, h->ws_sz, h->stream);
+    return (st == HIPBLAS_STATUS_SUCCESS) ? 0 : -1;
 }
 
 static inline int gb_gemm(gb_blas_handle_t h, gb_prec_t prec,
                           int M, int N, int K,
                           const void *A, const void *B, void *C)
 {
+    /* fp8 계열은 hipBLASLt 경로 (rocblas_gemm_ex 미지원) */
+    if (prec == GB_PREC_FP8 || prec == GB_PREC_FP8_MIX)
+        return gb_gemm_fp8(h, prec, M, N, K, A, B, C);
+
+    rocblas_handle rb = h->blas;
     const rocblas_operation opN = rocblas_operation_none;
     const rocblas_gemm_algo algo = rocblas_gemm_algo_standard;
     const int32_t  sol   = 0;
@@ -143,7 +224,7 @@ static inline int gb_gemm(gb_blas_handle_t h, gb_prec_t prec,
     switch (prec) {
     case GB_PREC_DGEMM: {
         const double alpha = 1.0, beta = 0.0;
-        st = rocblas_gemm_ex(h, opN, opN, M, N, K, &alpha,
+        st = rocblas_gemm_ex(rb, opN, opN, M, N, K, &alpha,
                 A, rocblas_datatype_f64_r, M,
                 B, rocblas_datatype_f64_r, K, &beta,
                 C, rocblas_datatype_f64_r, M,
@@ -155,7 +236,7 @@ static inline int gb_gemm(gb_blas_handle_t h, gb_prec_t prec,
         /* FP16 in / FP16 acc */
         const rocblas_half alpha = (rocblas_half){0x3C00};  /* 1.0 in fp16 */
         const rocblas_half beta  = (rocblas_half){0x0000};  /* 0.0 in fp16 */
-        st = rocblas_gemm_ex(h, opN, opN, M, N, K, &alpha,
+        st = rocblas_gemm_ex(rb, opN, opN, M, N, K, &alpha,
                 A, rocblas_datatype_f16_r, M,
                 B, rocblas_datatype_f16_r, K, &beta,
                 C, rocblas_datatype_f16_r, M,
@@ -166,7 +247,7 @@ static inline int gb_gemm(gb_blas_handle_t h, gb_prec_t prec,
     case GB_PREC_HGEMM_MIX: {
         /* FP16 in / FP32 acc — alpha,beta 는 compute_type(FP32) 기준 */
         const float alpha = 1.f, beta = 0.f;
-        st = rocblas_gemm_ex(h, opN, opN, M, N, K, &alpha,
+        st = rocblas_gemm_ex(rb, opN, opN, M, N, K, &alpha,
                 A, rocblas_datatype_f16_r, M,
                 B, rocblas_datatype_f16_r, K, &beta,
                 C, rocblas_datatype_f16_r, M,
@@ -177,7 +258,7 @@ static inline int gb_gemm(gb_blas_handle_t h, gb_prec_t prec,
     case GB_PREC_BF16: {
         /* BF16 in / FP32 acc — alpha,beta 는 compute_type(FP32) 기준 */
         const float alpha = 1.f, beta = 0.f;
-        st = rocblas_gemm_ex(h, opN, opN, M, N, K, &alpha,
+        st = rocblas_gemm_ex(rb, opN, opN, M, N, K, &alpha,
                 A, rocblas_datatype_bf16_r, M,
                 B, rocblas_datatype_bf16_r, K, &beta,
                 C, rocblas_datatype_bf16_r, M,
@@ -189,7 +270,7 @@ static inline int gb_gemm(gb_blas_handle_t h, gb_prec_t prec,
     case GB_PREC_SGEMM_TF32:   /* RDNA3: TF32 가속 경로 없음 → f32 폴백 */
     default: {
         const float alpha = 1.f, beta = 0.f;
-        st = rocblas_gemm_ex(h, opN, opN, M, N, K, &alpha,
+        st = rocblas_gemm_ex(rb, opN, opN, M, N, K, &alpha,
                 A, rocblas_datatype_f32_r, M,
                 B, rocblas_datatype_f32_r, K, &beta,
                 C, rocblas_datatype_f32_r, M,

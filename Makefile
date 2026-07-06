@@ -64,7 +64,7 @@ ifeq ($(backend),nvidia)
 
 NVCC    ?= nvcc
 CC       = $(NVCC)
-LIBS     = -lcublas -lnvidia-ml
+LIBS     = -lcublas -lcublasLt -lnvidia-ml
 CFLAGS   = -DGB_BACKEND_NVIDIA -O3 -Xcompiler -pthread,-O3
 
 ## NVIDIA 빌드 모드: native (기본)
@@ -113,7 +113,7 @@ else ifeq ($(backend),amd)
 HIPCC   ?= hipcc
 CC       = $(HIPCC)
 ROCM    ?= /opt/rocm
-LIBS     = -L$(ROCM)/lib -lrocblas -lamd_smi
+LIBS     = -L$(ROCM)/lib -lrocblas -lhipblaslt -lamd_smi
 ## hipcc(clang)는 -Xcompiler 문법을 받지 않음 → -pthread 직접 전달
 CFLAGS   = -DGB_BACKEND_AMD -O3 -pthread -I. -I$(ROCM)/include
 

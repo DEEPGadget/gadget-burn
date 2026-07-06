@@ -11,12 +11,26 @@ gadget_burn은 정밀도(`-p`)에 따라 다른 GEMM을 실행하고, 각 GPU의
 | `hgemm` | FP16 in / FP16 acc | `CUDA_R_16F` + `COMPUTE_16F` + TENSOR_OP | `f16_r` + `f16_r` |
 | `hgemm_mix` | FP16 in / FP32 acc | `CUDA_R_16F` + `COMPUTE_32F` + TENSOR_OP | `f16_r` + `f32_r` |
 | `bf16` | BF16 in / FP32 acc | `CUDA_R_16BF` + `COMPUTE_32F` + TENSOR_OP | `bf16_r` + `f32_r` |
+| `fp8` | FP8(e4m3) in / e4m3 out, FP32 acc | cuBLASLt `CUDA_R_8F_E4M3` | hipBLASLt `HIP_R_8F_E4M3` |
+| `fp8_mix` | FP8(e4m3) in / BF16 out, FP32 acc | cuBLASLt (out `CUDA_R_16BF`) | hipBLASLt (out `HIP_R_16BF`) |
 | `sgemm_tf32` | FP32 storage + TF32 compute | `COMPUTE_32F_FAST_TF32` + TENSOR_OP | (TF32 미지원 → f32 폴백) |
 
 `bf16`은 대부분의 매트릭스 코어에서 FP16(mix)과 **동일 처리율**이라 Rpeak도 `tc_ops_mix`를
 재사용합니다(코어 테이블 신규 필드 불필요). BF16은 지수부 8-bit라 FP32급 넓은 범위를 갖고
-누산은 FP32로 수행됩니다. (fp8은 rocBLAS/cublasGemmEx 경로가 아닌 hipBLASLt/cuBLASLt가
-필요해 별도 후속 작업으로 다룹니다.)
+누산은 FP32로 수행됩니다.
+
+### fp8 (e4m3)
+
+`fp8`/`fp8_mix`는 `rocblas_gemm_ex`/`cublasGemmEx` 에 fp8 경로가 없어 **hipBLASLt / cuBLASLt**
+(Lt 계열 API, matmul descriptor·layout·workspace·algo heuristic)로 실행합니다. 입력은 OCP e4m3,
+누산은 FP32, 출력만 다릅니다(`fp8`=e4m3 1B, `fp8_mix`=bf16 2B). 지원 HW(코어 테이블
+`tc_ops_fp8>0`: RDNA4·CDNA3+·NVIDIA Ada/Hopper+)가 아니면 **시작 단계에서 명시 종료**합니다.
+
+- **Rpeak**: fp8 은 지원 HW 에서 FP16 의 2배 = `tc_ops_fp8 = 2 × tc_ops_mix`.
+  (소비자 NVIDIA 는 FP32 누산 시 1× 로 떨어지지만 `tc_ops_mix` 가 이미 반속이라 자동 반영.)
+- **주의(RDNA4/gfx1201)**: hipBLASLt 의 소비자 RDNA4 fp8 커널이 아직 미성숙해 실측이 이론(2×)에
+  크게 못 미칩니다(Peak% 낮음, 정직 반영). 또한 `fp8`(e4m3 출력)은 **N=8192·16384 에서 커널
+  갭으로 저성능** — 다른 크기(`-X 4096` 등)나 `fp8_mix` 권장. NVIDIA fp8 은 실기 미검증입니다.
 
 모든 GEMM은 modern API(`cublasGemmEx` / `rocblas_gemm_ex`)로 통일되어 compute type과 data type이 명시 지정됩니다.
 

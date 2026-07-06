@@ -71,8 +71,12 @@ make info                     # 바이너리에 포함된 GPU 코드 목록(NVID
 
 - **본체의 벤더 중립성을 유지**한다. `gadget_burn.cu`에서 `cuda*`/`gb_*` 외의 벤더 SDK
   심볼(cublas*, hip*, rocblas*, nvml* 등)을 직접 쓰지 않는다. 새 벤더 동작은 backend 헤더로.
-- **새 정밀도 추가**: `gb_prec_t`(gpu_backend.h) → 두 backend의 `gb_gemm()` →
-  본체 `calc_dynamic_rpeak`/옵션 파싱/`prec_str` 전부 함께 갱신.
+- **새 정밀도 추가**: `gb_prec_t`(gpu_backend.h, **enum 은 끝에 추가** — `prec_str[]` 가
+  서수 인덱싱) → 두 backend의 `gb_gemm()` → 본체 `calc_dynamic_rpeak`/옵션 파싱/`prec_str`/
+  `prec_label`/`init_buffer_random`/`prec_in_bpe`·`prec_out_bpe`(입출력 요소 크기가 다르면)
+  전부 갱신. **fp8 은 rocblas_gemm_ex/cublasGemmEx 에 없어 hipBLASLt/cuBLASLt(Lt) 경로**를
+  타며, `gb_blas_handle_t` 가 Lt 핸들·workspace·실행계획을 함께 보관하는 struct 포인터다
+  (fp8 입력 1B / mix 출력 2B 처럼 입출력 bpe 가 다를 수 있으므로 헬퍼로 분리).
 - **GPU 추가**: 해당 `core_table_*.h`에만 엔트리 추가. **구체적(긴) 이름을 먼저 배치**
   (substring 선매칭). NVIDIA/AMD 필드 의미가 다르므로 각 헤더 상단 주석을 따른다
   (특히 AMD는 `cores_tensor`=CU 수, `tc_ops`=CU당 matrix OPS, `fp32_matrix_ops` 재해석).
@@ -96,6 +100,12 @@ make info                     # 바이너리에 포함된 GPU 코드 목록(NVID
 - **백엔드별 기본 정밀도가 다름**: NVIDIA=`sgemm_tf32`(gpu-burn -tc 호환),
   AMD=`hgemm_mix`(Matrix Core 네이티브 고속 경로). TF32 미지원 HW는 FP32로 폴백.
 - **AMD throttle 비트는 보수적 매핑**(현재 0이 아니면 POWER_BRAKE). gfx별 정밀화는 TODO.
+- **fp8(-p fp8/fp8_mix)은 Lt 경로**(hipBLASLt/cuBLASLt). 주의: ① 소비자 RDNA4(gfx1201)의
+  hipBLASLt fp8 커널이 미성숙해 실측이 이론(2×fp16)에 크게 못 미침(Peak% 낮게 = 정직). ②
+  fp8(e4m3 출력)은 N=8192·16384 에서 커널 갭으로 저성능 → `fp8_mix`나 다른 크기 권장. ③
+  gfx1201 은 `COMPUTE_32F`(fp32 누산)만 유효, `COMPUTE_16F` 는 무효 커널(물리 불가 TFLOPS).
+  ④ cuBLASLt fp8 은 TN(opA=T) 레이아웃 강제이며 NVIDIA fp8 HW 실기 미검증. 미지원 HW
+  (`tc_ops_fp8=0`)는 시작 단계에서 명시 종료.
 
 ## 검증 환경
 

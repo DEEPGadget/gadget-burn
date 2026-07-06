@@ -13,8 +13,10 @@
 #include <stdlib.h>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <cublasLt.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <nvml.h>
 
 /* NVIDIA GPU 코어 DB (동적 Rpeak 계산용 GB_NVIDIA_CORE_ENTRIES 매크로 제공).
@@ -29,6 +31,9 @@ static inline gb_half gb_float2half(float f) { return __float2half(f); }
 
 /* GPU bfloat16 타입 (BF16 in / FP32 acc 경로용). CUDA 는 __nv_bfloat16 제공. */
 typedef __nv_bfloat16 gb_bfloat16;
+
+/* GPU fp8 타입 (OCP e4m3). Ada/Hopper+ 의 fp8 GEMM 입력용. */
+typedef __nv_fp8_e4m3 gb_fp8;
 
 /* ─────────────────────────────────────────────────────────
    Runtime 타입 별칭 (본체가 gb_stream_t 등으로 참조)
@@ -75,21 +80,92 @@ static inline void gb_init_device_order(void)
 /* ─────────────────────────────────────────────────────────
    BLAS GEMM
    ───────────────────────────────────────────────────────── */
-typedef cublasHandle_t gb_blas_handle_t;
+/* fp8(e4m3) GEMM 은 cublasGemmEx 에 없고 cuBLASLt 가 담당하므로, 핸들에
+   cuBLAS 핸들 + cuBLASLt 핸들 + workspace + fp8 실행계획 캐시를 함께 보관한다.
+   본체는 gb_blas_handle_t 를 opaque 하게만 사용(포인터). */
+typedef struct {
+    cublasHandle_t     blas;
+    cublasLtHandle_t   lt;
+    void              *ws;
+    size_t             ws_sz;
+    cudaStream_t       stream;
+    int                        lt_ready;   /* fp8 계획 lazy 구성 여부 */
+    cublasLtMatmulDesc_t       lt_desc;
+    cublasLtMatrixLayout_t     lt_lA, lt_lB, lt_lC, lt_lD;
+    cublasLtMatmulHeuristicResult_t lt_heur;
+} gb_blas_ctx_t;
+typedef gb_blas_ctx_t* gb_blas_handle_t;
 
 static inline int gb_blas_create(gb_blas_handle_t *h, gb_stream_t stream)
 {
-    if (cublasCreate(h) != CUBLAS_STATUS_SUCCESS) return -1;
-    cublasSetStream(*h, stream);
-    /* Modern API: cublasGemmEx 가 compute type 을 명시 지정하므로
-       handle math mode 는 무영향. DEFAULT 고정. */
-    cublasSetMathMode(*h, CUBLAS_DEFAULT_MATH);
+    gb_blas_ctx_t *c = (gb_blas_ctx_t *)calloc(1, sizeof(gb_blas_ctx_t));
+    if (!c) return -1;
+    c->stream = stream;
+    if (cublasCreate(&c->blas) != CUBLAS_STATUS_SUCCESS) { free(c); return -1; }
+    cublasSetStream(c->blas, stream);
+    cublasSetMathMode(c->blas, CUBLAS_DEFAULT_MATH);
+    if (cublasLtCreate(&c->lt) != CUBLAS_STATUS_SUCCESS) { cublasDestroy(c->blas); free(c); return -1; }
+    c->ws_sz = 128ull * 1024 * 1024;
+    if (cudaMalloc(&c->ws, c->ws_sz) != cudaSuccess) { c->ws = NULL; c->ws_sz = 0; }
+    *h = c;
     return 0;
 }
 
 static inline void gb_blas_destroy(gb_blas_handle_t h)
 {
-    cublasDestroy(h);
+    if (!h) return;
+    if (h->lt_ready) {
+        cublasLtMatrixLayoutDestroy(h->lt_lA);
+        cublasLtMatrixLayoutDestroy(h->lt_lB);
+        cublasLtMatrixLayoutDestroy(h->lt_lC);
+        cublasLtMatrixLayoutDestroy(h->lt_lD);
+        cublasLtMatmulDescDestroy(h->lt_desc);
+    }
+    if (h->ws) cudaFree(h->ws);
+    cublasLtDestroy(h->lt);
+    cublasDestroy(h->blas);
+    free(h);
+}
+
+/* fp8(e4m3) GEMM via cuBLASLt.
+     GB_PREC_FP8     : e4m3 in / e4m3 out
+     GB_PREC_FP8_MIX : e4m3 in / bf16 out
+   compute=FP32. cuBLASLt fp8 는 "TN"(opA=T, opB=N) 레이아웃만 지원하므로
+   A 를 transpose 로 지정한다(정사각 M=N=K 라 버퍼 크기는 동일; burn 목적상
+   결과 정확성은 무의미). 첫 호출 시 desc/layout/algo 를 캐시.
+   ※ NVIDIA fp8 HW 미보유로 실기 미검증 — 실패 시 본체가 명시 종료. */
+static inline int gb_gemm_fp8(gb_blas_handle_t h, gb_prec_t prec,
+                              int M, int N, int K,
+                              const void *A, const void *B, void *C)
+{
+    if (!h->lt_ready) {
+        cudaDataType_t outT = (prec == GB_PREC_FP8) ? CUDA_R_8F_E4M3 : CUDA_R_16BF;
+        if (cublasLtMatmulDescCreate(&h->lt_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F)
+            != CUBLAS_STATUS_SUCCESS) return -1;
+        cublasOperation_t opT = CUBLAS_OP_T, opN = CUBLAS_OP_N;
+        cublasLtMatmulDescSetAttribute(h->lt_desc, CUBLASLT_MATMUL_DESC_TRANSA, &opT, sizeof(opT));
+        cublasLtMatmulDescSetAttribute(h->lt_desc, CUBLASLT_MATMUL_DESC_TRANSB, &opN, sizeof(opN));
+        /* TN: A=[K,M] ld=K, B=[K,N] ld=K, C/D=[M,N] ld=M */
+        cublasLtMatrixLayoutCreate(&h->lt_lA, CUDA_R_8F_E4M3, K, M, K);
+        cublasLtMatrixLayoutCreate(&h->lt_lB, CUDA_R_8F_E4M3, K, N, K);
+        cublasLtMatrixLayoutCreate(&h->lt_lC, outT, M, N, M);
+        cublasLtMatrixLayoutCreate(&h->lt_lD, outT, M, N, M);
+        cublasLtMatmulPreference_t pref;
+        if (cublasLtMatmulPreferenceCreate(&pref) != CUBLAS_STATUS_SUCCESS) return -1;
+        cublasLtMatmulPreferenceSetAttribute(pref,
+            CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &h->ws_sz, sizeof(h->ws_sz));
+        int found = 0;
+        cublasStatus_t st = cublasLtMatmulAlgoGetHeuristic(h->lt, h->lt_desc,
+            h->lt_lA, h->lt_lB, h->lt_lC, h->lt_lD, pref, 1, &h->lt_heur, &found);
+        cublasLtMatmulPreferenceDestroy(pref);
+        if (st != CUBLAS_STATUS_SUCCESS || found == 0) return -1;
+        h->lt_ready = 1;
+    }
+    const float alpha = 1.f, beta = 0.f;
+    cublasStatus_t st = cublasLtMatmul(h->lt, h->lt_desc, &alpha,
+        A, h->lt_lA, B, h->lt_lB, &beta,
+        C, h->lt_lC, C, h->lt_lD, &h->lt_heur.algo, h->ws, h->ws_sz, h->stream);
+    return (st == CUBLAS_STATUS_SUCCESS) ? 0 : -1;
 }
 
 /* op=N/N, alpha=1, beta=0, lda=M ldb=K ldc=M 고정.
@@ -98,11 +174,16 @@ static inline int gb_gemm(gb_blas_handle_t h, gb_prec_t prec,
                           int M, int N, int K,
                           const void *A, const void *B, void *C)
 {
+    /* fp8 계열은 cuBLASLt 경로 (cublasGemmEx 미지원) */
+    if (prec == GB_PREC_FP8 || prec == GB_PREC_FP8_MIX)
+        return gb_gemm_fp8(h, prec, M, N, K, A, B, C);
+
+    cublasHandle_t hb = h->blas;
     cublasStatus_t st;
     switch (prec) {
     case GB_PREC_SGEMM: {
         const float alpha = 1.f, beta = 0.f;
-        st = cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, M, N, K,
+        st = cublasGemmEx(hb, CUBLAS_OP_N, CUBLAS_OP_N, M, N, K,
                           &alpha, A, CUDA_R_32F, M,
                                   B, CUDA_R_32F, K,
                           &beta,  C, CUDA_R_32F, M,
@@ -111,7 +192,7 @@ static inline int gb_gemm(gb_blas_handle_t h, gb_prec_t prec,
     }
     case GB_PREC_DGEMM: {
         const double alpha = 1.0, beta = 0.0;
-        st = cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, M, N, K,
+        st = cublasGemmEx(hb, CUBLAS_OP_N, CUBLAS_OP_N, M, N, K,
                           &alpha, A, CUDA_R_64F, M,
                                   B, CUDA_R_64F, K,
                           &beta,  C, CUDA_R_64F, M,
@@ -120,7 +201,7 @@ static inline int gb_gemm(gb_blas_handle_t h, gb_prec_t prec,
     }
     case GB_PREC_HGEMM: {
         const __half alpha = __float2half(1.f), beta = __float2half(0.f);
-        st = cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, M, N, K,
+        st = cublasGemmEx(hb, CUBLAS_OP_N, CUBLAS_OP_N, M, N, K,
                           &alpha, A, CUDA_R_16F, M,
                                   B, CUDA_R_16F, K,
                           &beta,  C, CUDA_R_16F, M,
@@ -129,7 +210,7 @@ static inline int gb_gemm(gb_blas_handle_t h, gb_prec_t prec,
     }
     case GB_PREC_HGEMM_MIX: {
         const float alpha = 1.f, beta = 0.f;   /* FP16 in, FP32 acc */
-        st = cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, M, N, K,
+        st = cublasGemmEx(hb, CUBLAS_OP_N, CUBLAS_OP_N, M, N, K,
                           &alpha, A, CUDA_R_16F, M,
                                   B, CUDA_R_16F, K,
                           &beta,  C, CUDA_R_16F, M,
@@ -138,7 +219,7 @@ static inline int gb_gemm(gb_blas_handle_t h, gb_prec_t prec,
     }
     case GB_PREC_BF16: {
         const float alpha = 1.f, beta = 0.f;   /* BF16 in, FP32 acc */
-        st = cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, M, N, K,
+        st = cublasGemmEx(hb, CUBLAS_OP_N, CUBLAS_OP_N, M, N, K,
                           &alpha, A, CUDA_R_16BF, M,
                                   B, CUDA_R_16BF, K,
                           &beta,  C, CUDA_R_16BF, M,
@@ -148,7 +229,7 @@ static inline int gb_gemm(gb_blas_handle_t h, gb_prec_t prec,
     case GB_PREC_SGEMM_TF32:
     default: {
         const float alpha = 1.f, beta = 0.f;
-        st = cublasGemmEx(h, CUBLAS_OP_N, CUBLAS_OP_N, M, N, K,
+        st = cublasGemmEx(hb, CUBLAS_OP_N, CUBLAS_OP_N, M, N, K,
                           &alpha, A, CUDA_R_32F, M,
                                   B, CUDA_R_32F, K,
                           &beta,  C, CUDA_R_32F, M,

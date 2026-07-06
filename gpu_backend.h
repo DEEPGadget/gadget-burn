@@ -70,8 +70,12 @@ typedef enum {
     GB_PREC_HGEMM_MIX,  /* FP16 in / FP32 acc (mixed precision)         */
     GB_PREC_SGEMM_TF32, /* FP32 storage + TF32/XF32 compute
                            (RDNA3 등 미지원 HW에서는 FP32로 폴백)        */
-    GB_PREC_BF16        /* BF16 in / FP32 acc (Tensor/Matrix Core).
-                           FP16 과 동일 처리율(Rpeak=tc_ops_mix 기준).
+    GB_PREC_BF16,       /* BF16 in / FP32 acc (Tensor/Matrix Core).
+                           FP16 과 동일 처리율(Rpeak=tc_ops_mix 기준).        */
+    GB_PREC_FP8,        /* FP8(e4m3) in / e4m3 out, FP32 acc (hipBLASLt/cuBLASLt).
+                           지원 HW 에서 FP16 의 2배 처리율(Rpeak=tc_ops_fp8). */
+    GB_PREC_FP8_MIX     /* FP8(e4m3) in / BF16(또는 FP16) out, FP32 acc.
+                           fp8 과 동일 rate, 출력만 고정밀.
                            ※ enum 은 항상 끝에 추가 — 본체 prec_str[] 가
                               서수(ordinal)로 인덱싱하므로 순서 변경 금지. */
 } gb_prec_t;
