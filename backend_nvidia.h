@@ -127,9 +127,7 @@ static inline void gb_blas_destroy(gb_blas_handle_t h)
     free(h);
 }
 
-/* fp8(e4m3) GEMM via cuBLASLt.
-     GB_PREC_FP8     : e4m3 in / e4m3 out
-     GB_PREC_FP8_MIX : e4m3 in / bf16 out
+/* fp8(e4m3) GEMM via cuBLASLt. e4m3 in / FP32 누산 / bf16 out(최종 downcast).
    compute=FP32. cuBLASLt fp8 는 "TN"(opA=T, opB=N) 레이아웃만 지원하므로
    A 를 transpose 로 지정한다(정사각 M=N=K 라 버퍼 크기는 동일; burn 목적상
    결과 정확성은 무의미). 첫 호출 시 desc/layout/algo 를 캐시.
@@ -138,8 +136,9 @@ static inline int gb_gemm_fp8(gb_blas_handle_t h, gb_prec_t prec,
                               int M, int N, int K,
                               const void *A, const void *B, void *C)
 {
+    (void)prec;
     if (!h->lt_ready) {
-        cudaDataType_t outT = (prec == GB_PREC_FP8) ? CUDA_R_8F_E4M3 : CUDA_R_16BF;
+        cudaDataType_t outT = CUDA_R_16BF;
         if (cublasLtMatmulDescCreate(&h->lt_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F)
             != CUBLAS_STATUS_SUCCESS) return -1;
         cublasOperation_t opT = CUBLAS_OP_T, opN = CUBLAS_OP_N;
@@ -175,7 +174,7 @@ static inline int gb_gemm(gb_blas_handle_t h, gb_prec_t prec,
                           const void *A, const void *B, void *C)
 {
     /* fp8 계열은 cuBLASLt 경로 (cublasGemmEx 미지원) */
-    if (prec == GB_PREC_FP8 || prec == GB_PREC_FP8_MIX)
+    if (prec == GB_PREC_FP8)
         return gb_gemm_fp8(h, prec, M, N, K, A, B, C);
 
     cublasHandle_t hb = h->blas;
@@ -272,14 +271,14 @@ static inline double gb_gemm_autotune(gb_blas_handle_t h, gb_prec_t prec,
                                       int M, int N, int K,
                                       const void *A, const void *B, void *C)
 {
-    if (prec != GB_PREC_FP8 && prec != GB_PREC_FP8_MIX)
+    if (prec != GB_PREC_FP8)
         return 0.0;   /* 클래식 경로: cuBLAS 기본 선택 사용 */
 
     cudaEvent_t e0, e1; cudaEventCreate(&e0); cudaEventCreate(&e1);
     const double flop = 2.0 * M * (double)N * K;
     double best_tf = 0.0;
 
-    cudaDataType_t outT = (prec == GB_PREC_FP8) ? CUDA_R_8F_E4M3 : CUDA_R_16BF;
+    cudaDataType_t outT = CUDA_R_16BF;
     if (cublasLtMatmulDescCreate(&h->lt_desc, CUBLAS_COMPUTE_32F, CUDA_R_32F)
         == CUBLAS_STATUS_SUCCESS) {
         cublasOperation_t opT = CUBLAS_OP_T, opN = CUBLAS_OP_N;

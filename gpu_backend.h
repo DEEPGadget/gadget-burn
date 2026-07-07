@@ -72,12 +72,12 @@ typedef enum {
                            (RDNA3 등 미지원 HW에서는 FP32로 폴백)        */
     GB_PREC_BF16,       /* BF16 in / FP32 acc (Tensor/Matrix Core).
                            FP16 과 동일 처리율(Rpeak=tc_ops_mix 기준).        */
-    GB_PREC_FP8,        /* FP8(e4m3) in / e4m3 out, FP32 acc (hipBLASLt/cuBLASLt).
-                           지원 HW 에서 FP16 의 2배 처리율(Rpeak=tc_ops_fp8). */
-    GB_PREC_FP8_MIX     /* FP8(e4m3) in / BF16(또는 FP16) out, FP32 acc.
-                           fp8 과 동일 rate, 출력만 고정밀.
-                           ※ enum 은 항상 끝에 추가 — 본체 prec_str[] 가
-                              서수(ordinal)로 인덱싱하므로 순서 변경 금지. */
+    GB_PREC_FP8         /* FP8(e4m3) in / FP32 누산 (hipBLASLt/cuBLASLt). 출력은
+                           bf16(단순 최종 downcast, 성능·연산 의미 없음).
+                           지원 HW 에서 FP16 의 2배 처리율(Rpeak=tc_ops_fp8).
+                           플래그명 fp8_afp32 (= fp8 accumulate fp32). fp16/bf16
+                           누산은 gfx1201 등에서 무효(무연산)라 FP32 만 제공.
+                           ※ enum 은 항상 끝에 추가 — prec_str[] 서수 인덱싱. */
 } gb_prec_t;
 
 /* 백엔드별 기본 정밀도 (-p 미지정 시).

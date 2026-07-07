@@ -175,17 +175,16 @@ static inline void gb_blas_destroy(gb_blas_handle_t h)
     free(h);
 }
 
-/* fp8(e4m3) GEMM via hipBLASLt.
-     GB_PREC_FP8     : e4m3 in / e4m3 out
-     GB_PREC_FP8_MIX : e4m3 in / bf16 out
-   compute=FP32 (gfx1201 에서 유효한 유일 경로; fp16 누산은 무효 커널).
+/* fp8(e4m3) GEMM via hipBLASLt. e4m3 in / FP32 누산 / bf16 out(최종 downcast).
+   compute=FP32 (gfx1201 에서 유효한 유일 경로; fp16/bf16 누산은 무효 커널로 확인됨).
    첫 호출 시 desc/layout/algo 를 캐시. 지원 algo 가 없으면 -1(→ 본체가 종료). */
 static inline int gb_gemm_fp8(gb_blas_handle_t h, gb_prec_t prec,
                               int M, int N, int K,
                               const void *A, const void *B, void *C)
 {
+    (void)prec;
     if (!h->lt_ready) {
-        hipDataType outT = (prec == GB_PREC_FP8) ? HIP_R_8F_E4M3 : HIP_R_16BF;
+        hipDataType outT = HIP_R_16BF;
         if (hipblasLtMatmulDescCreate(&h->lt_desc, HIPBLAS_COMPUTE_32F, HIP_R_32F)
             != HIPBLAS_STATUS_SUCCESS) return -1;
         hipblasLtMatrixLayoutCreate(&h->lt_lA, HIP_R_8F_E4M3, M, K, M);
@@ -289,7 +288,7 @@ static inline int gb_gemm(gb_blas_handle_t h, gb_prec_t prec,
                           const void *A, const void *B, void *C)
 {
     /* fp8 계열은 hipBLASLt 경로 (rocblas_gemm_ex 미지원) */
-    if (prec == GB_PREC_FP8 || prec == GB_PREC_FP8_MIX)
+    if (prec == GB_PREC_FP8)
         return gb_gemm_fp8(h, prec, M, N, K, A, B, C);
     /* autotune 이 고른 solution(rb_sol) 사용 (미튜닝 시 0=기본) */
     return (rb_gemm_call(h->blas, prec, M, N, K, A, B, C, h->rb_sol)
@@ -343,8 +342,8 @@ static inline double gb_gemm_autotune(gb_blas_handle_t h, gb_prec_t prec,
     const double flop = 2.0 * M * (double)N * K;
     double best_tf = 0.0;
 
-    if (prec == GB_PREC_FP8 || prec == GB_PREC_FP8_MIX) {
-        hipDataType outT = (prec == GB_PREC_FP8) ? HIP_R_8F_E4M3 : HIP_R_16BF;
+    if (prec == GB_PREC_FP8) {
+        hipDataType outT = HIP_R_16BF;
         if (hipblasLtMatmulDescCreate(&h->lt_desc, HIPBLAS_COMPUTE_32F, HIP_R_32F)
             == HIPBLAS_STATUS_SUCCESS) {
             hipblasLtMatrixLayoutCreate(&h->lt_lA, HIP_R_8F_E4M3, M, K, M);

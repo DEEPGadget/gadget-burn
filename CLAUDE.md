@@ -106,12 +106,12 @@ make info                     # 바이너리에 포함된 GPU 코드 목록(NVID
   `rocblas_gemm_ex_get_solutions`(beta API, `ROCBLAS_BETA_FEATURES`), Lt 는 heuristic 리스트.
   느린 후보로 초기화가 수십 초~2분 걸릴 수 있음(early-abort 스크린으로 제한). NVIDIA 클래식
   경로(cublasGemmEx)는 no-op(cuBLAS 기본이 이미 양호).
-- **fp8(-p fp8/fp8_mix)은 Lt 경로**(hipBLASLt/cuBLASLt). 주의: ① 소비자 RDNA4(gfx1201)의
-  hipBLASLt fp8 커널이 미성숙해 실측이 이론(2×fp16)에 크게 못 미침(Peak% 낮게 = 정직). ②
-  fp8(e4m3 출력)은 N=8192·16384 에서 커널 갭으로 저성능 → `fp8_mix`나 다른 크기 권장. ③
-  gfx1201 은 `COMPUTE_32F`(fp32 누산)만 유효, `COMPUTE_16F` 는 무효 커널(물리 불가 TFLOPS).
-  ④ cuBLASLt fp8 은 TN(opA=T) 레이아웃 강제이며 NVIDIA fp8 HW 실기 미검증. 미지원 HW
-  (`tc_ops_fp8=0`)는 시작 단계에서 명시 종료.
+- **fp8(-p fp8_afp32, 별칭 fp8)은 Lt 경로**(hipBLASLt/cuBLASLt). 누산 기준 단일 옵션 —
+  출력 타입은 최종 downcast 라 의미 없어 구분 안 함(항상 bf16 out). 주의: ① gfx1201 은
+  `COMPUTE_32F`(fp32 누산)만 유효, `COMPUTE_16F`(fp16 누산)는 **무효 커널**(연산 안 함, C=0,
+  물리 불가 TFLOPS)이고 bf16 누산은 API 없음 → FP32 누산만 제공. ② 소비자 RDNA4 hipBLASLt
+  fp8 커널이 미성숙해 실측이 이론(2×fp16)에 못 미침(autotune 으로 상당 회복). ③ cuBLASLt fp8
+  은 TN(opA=T) 강제·NVIDIA 실기 미검증. 미지원 HW(`tc_ops_fp8=0`)는 시작 시 명시 종료.
 
 ## 검증 환경
 

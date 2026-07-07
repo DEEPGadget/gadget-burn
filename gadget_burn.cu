@@ -13,7 +13,7 @@
  *
  *   -t <초>       총 측정 시간                       (기본: 3600)
  *   -i <강도>     GPU 당 동시 GEMM 스트림 수         (기본: 1)
- *   -p <타입>     sgemm|dgemm|hgemm|hgemm_mix|bf16|fp8|fp8_mix|sgemm_tf32 (기본: sgemm_tf32)
+ *   -p <타입>     sgemm|dgemm|hgemm|hgemm_mix|bf16|fp8_afp32|sgemm_tf32 (기본: sgemm_tf32)
  *                 hgemm      → FP16 in / FP16 acc Tensor Core (피크 TFLOPS 최대)
  *                 hgemm_mix  → FP16 in / FP32 acc Tensor Core (mixed precision)
  *                 sgemm_tf32 → FP32 storage + TF32 Tensor Core (기본, gpu-burn -tc 호환)
@@ -317,7 +317,6 @@ typedef gb_prec_t PrecType;
 #define PREC_SGEMM_TF32  GB_PREC_SGEMM_TF32
 #define PREC_BF16        GB_PREC_BF16
 #define PREC_FP8         GB_PREC_FP8
-#define PREC_FP8_MIX     GB_PREC_FP8_MIX
 
 /* random init dispatch helper (PrecType 정의 후) */
 static void init_buffer_random(void *buf, size_t n_elem, PrecType prec,
@@ -340,7 +339,6 @@ static void init_buffer_random(void *buf, size_t n_elem, PrecType prec,
                 (gb_bfloat16 *)buf, n_elem, seed);
             break;
         case PREC_FP8:
-        case PREC_FP8_MIX:
             init_random_fp8<<<blocks, threads, 0, stream>>>(
                 (gb_fp8 *)buf, n_elem, seed);
             break;
@@ -352,14 +350,14 @@ static void init_buffer_random(void *buf, size_t n_elem, PrecType prec,
 }
 
 /* 정밀도별 입력(A,B) / 출력(C) 요소 바이트 수.
-   대부분 in==out 이지만 fp8_mix 는 입력 1B(e4m3) / 출력 2B(bf16) 로 다르다. */
+   대부분 in==out 이지만 fp8 은 입력 1B(e4m3) / 출력 2B(bf16 downcast) 로 다르다. */
 static inline size_t prec_in_bpe(PrecType p)
 {
     switch (p) {
         case PREC_DGEMM:                     return 8;
         case PREC_HGEMM: case PREC_HGEMM_MIX:
         case PREC_BF16:                      return 2;
-        case PREC_FP8:   case PREC_FP8_MIX:  return 1;
+        case PREC_FP8:                       return 1;   /* e4m3 입력 */
         default:                             return 4;   /* sgemm / tf32 */
     }
 }
@@ -369,8 +367,7 @@ static inline size_t prec_out_bpe(PrecType p)
         case PREC_DGEMM:                     return 8;
         case PREC_HGEMM: case PREC_HGEMM_MIX:
         case PREC_BF16:                      return 2;
-        case PREC_FP8:                       return 1;   /* e4m3 out */
-        case PREC_FP8_MIX:                   return 2;   /* bf16 out */
+        case PREC_FP8:                       return 2;   /* bf16 최종 downcast */
         default:                             return 4;
     }
 }
@@ -884,9 +881,8 @@ static double calc_dynamic_rpeak(const GpuCtx *gc, PrecType prec, double clock_m
             return gc->core_info.cores_tensor
                    * (double)gc->core_info.tc_ops_mix * clock_mhz * 1e-6;
         case PREC_FP8:
-        case PREC_FP8_MIX:
             /* fp8 = FP16 의 2배(=2×tc_ops_mix). 미지원 HW(tc_ops_fp8=0)는
-               본체가 -p fp8 요청 시 시작 단계에서 명시 종료하므로 여기 도달 안 함. */
+               본체가 -p fp8_afp32 요청 시 시작 단계에서 명시 종료하므로 여기 도달 안 함. */
             return gc->core_info.cores_tensor
                    * (double)gc->core_info.tc_ops_fp8 * clock_mhz * 1e-6;
         case PREC_SGEMM_TF32:
@@ -1142,8 +1138,7 @@ static const char *prec_label(PrecType p)
     case PREC_HGEMM:      return "HGEMM (FP16 in / FP16 acc)";
     case PREC_HGEMM_MIX:  return "HGEMM_MIX (FP16 in / FP32 acc)";
     case PREC_BF16:       return "BF16 (BF16 in / FP32 acc)";
-    case PREC_FP8:        return "FP8 (e4m3 in / e4m3 out, FP32 acc)";
-    case PREC_FP8_MIX:    return "FP8_MIX (e4m3 in / BF16 out, FP32 acc)";
+    case PREC_FP8:        return "FP8_AFP32 (e4m3 in / FP32 acc)";
     case PREC_SGEMM_TF32: return "SGEMM_TF32 (FP32 storage / TF32 compute)";
     case PREC_SGEMM:
     default:              return "SGEMM (FP32)";
@@ -1514,7 +1509,7 @@ static void print_usage(const char *prog)
     printf("\n사용법: %s [옵션]\n\n", prog);
     printf("  -t <초>      총 측정 시간                          (기본: 3600)\n");
     printf("  -i <강도>    GPU 당 동시 GEMM 스트림 수            (기본: 1)\n");
-    printf("  -p <타입>    sgemm | dgemm | hgemm | hgemm_mix | bf16 | fp8 | fp8_mix | sgemm_tf32\n");
+    printf("  -p <타입>    sgemm | dgemm | hgemm | hgemm_mix | bf16 | fp8_afp32 | sgemm_tf32\n");
     printf("               (기본: %s)\n", GB_DEFAULT_PREC_NAME);
     printf("               sgemm      → FP32 (cublasGemmEx, COMPUTE_32F)\n");
     printf("               dgemm      → FP64 (cublasGemmEx, COMPUTE_64F)\n");
@@ -1522,9 +1517,9 @@ static void print_usage(const char *prog)
     printf("                            이론 피크 TFLOPS가 가장 높음\n");
     printf("               bf16       → BF16 in / FP32 acc Tensor/Matrix Core\n");
     printf("                            FP16(mix)과 동일 처리율, 넓은 지수부(FP32급 범위)\n");
-    printf("               fp8        → FP8(e4m3) in / e4m3 out (hipBLASLt/cuBLASLt)\n");
+    printf("               fp8_afp32  → FP8(e4m3) in / FP32 누산 (hipBLASLt/cuBLASLt)\n");
     printf("                            지원 HW 는 FP16 의 2배 처리율. 미지원 HW 는 종료.\n");
-    printf("               fp8_mix    → FP8(e4m3) in / BF16 out (고정밀 출력)\n");
+    printf("                            (fp16/bf16 누산은 무효라 FP32 만 제공. `fp8` 별칭)\n");
 #if defined(GB_BACKEND_AMD)
     printf("               hgemm_mix  → FP16 in / FP32 acc Matrix Core (mixed precision) [기본]\n");
     printf("                            AMD Matrix Core(WMMA/MFMA)의 네이티브 고속 경로,\n");
@@ -1782,8 +1777,8 @@ int main(int argc, char **argv)
             else if (!strcmp(optarg, "hgemm_mix"))  cfg.prec = PREC_HGEMM_MIX;
             else if (!strcmp(optarg, "hgemm"))      cfg.prec = PREC_HGEMM;
             else if (!strcmp(optarg, "bf16"))       cfg.prec = PREC_BF16;
-            else if (!strcmp(optarg, "fp8"))        cfg.prec = PREC_FP8;
-            else if (!strcmp(optarg, "fp8_mix"))    cfg.prec = PREC_FP8_MIX;
+            else if (!strcmp(optarg, "fp8_afp32"))  cfg.prec = PREC_FP8;
+            else if (!strcmp(optarg, "fp8"))        cfg.prec = PREC_FP8;  /* 별칭 */
             else if (!strcmp(optarg, "sgemm_tf32")) cfg.prec = PREC_SGEMM_TF32;
             else if (!strcmp(optarg, "sgemm"))      cfg.prec = PREC_SGEMM;
             else                                    cfg.prec = GB_DEFAULT_PREC;
@@ -1875,8 +1870,7 @@ int main(int argc, char **argv)
         "HGEMM_MIX (FP16 in / FP32 acc, Tensor Core, mixed precision)",
         "SGEMM_TF32 (FP32 storage, TF32 Tensor Core compute)",
         "BF16 (BF16 in / FP32 acc, Tensor/Matrix Core)",
-        "FP8 (e4m3 in / e4m3 out, FP32 acc, hipBLASLt/cuBLASLt)",
-        "FP8_MIX (e4m3 in / BF16 out, FP32 acc, hipBLASLt/cuBLASLt)"
+        "FP8_AFP32 (e4m3 in / FP32 acc, hipBLASLt/cuBLASLt)"
     };
 
     /* ── 실행 설정 헤더 출력 ── */
@@ -1966,8 +1960,7 @@ int main(int argc, char **argv)
 
         /* fp8 요청 시 HW 지원 확인 (tc_ops_fp8=0 → 미지원). 조용한 폴백 대신
            명시적으로 종료해 사용자가 잘못된 결과를 얻지 않도록 한다. */
-        if ((cfg.prec == PREC_FP8 || cfg.prec == PREC_FP8_MIX)
-            && gc->core_info.tc_ops_fp8 == 0) {
+        if (cfg.prec == PREC_FP8 && gc->core_info.tc_ops_fp8 == 0) {
             fprintf(stderr,
                 "\n오류: GPU %d (%s) 는 fp8(-p %s) 을 지원하지 않습니다.\n"
                 "      fp8 가속은 RDNA4 / CDNA3+ (또는 NVIDIA Ada/Hopper+) 에서만 가능합니다.\n",
