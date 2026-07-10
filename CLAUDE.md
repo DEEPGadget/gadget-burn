@@ -129,6 +129,7 @@ make info                     # 바이너리에 포함된 GPU 코드 목록(NVID
 | `docs/measurement.md` | TFLOPS·Peak%·전력·Util·클럭·온도·throttle 측정 상세, 출력 컬럼 |
 | `docs/gpu-support.md` | 내장 코어 DB 전체, 미등록 GPU 추가 방법 |
 | `docs/RDNA4.md` | 소비자 RDNA4(gfx120x) 특성·주의(인덱스/온도/autotune/fp8), 최종 벤치 |
+| `docs/amd-benchmark.md` | AMD 3종(MI100/RX 7900 XTX/RX 9070 XT) 정밀도×행렬크기 스윕 결과·분석 |
 
 ## 작업 규약
 
